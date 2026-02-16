@@ -42,10 +42,6 @@ exec bwrap \
   `# Linuxbrew (claude, rg live here)` \
   --ro-bind /home/linuxbrew /home/linuxbrew \
   \
-  `# Snap (gh lives here)` \
-  --ro-bind /snap /snap \
-  --ro-bind /snap/bin /snap/bin \
-  \
   `# Workspace — the ONLY writable project area` \
   --bind "$WORKSPACE" "$WORKSPACE" \
   \
@@ -70,6 +66,7 @@ exec bwrap \
   --setenv PATH "/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
   --setenv SHELL /bin/bash \
   --setenv CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS 1 \
+  --setenv CLAUDE_CODE_DISABLE_AUTO_MEMORY 0 \
   --chdir "$STARTDIR" \
   \
   `# Isolate IPC/PID/UTS/cgroup but NOT user namespace (preserves docker group)` \

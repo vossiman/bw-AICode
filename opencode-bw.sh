@@ -45,10 +45,6 @@ exec bwrap \
   `# Linuxbrew (opencode, rg live here)` \
   --ro-bind /home/linuxbrew /home/linuxbrew \
   \
-  `# Snap (gh lives here)` \
-  --ro-bind /snap /snap \
-  --ro-bind /snap/bin /snap/bin \
-  \
   `# Workspace — the ONLY writable project area` \
   --bind "$WORKSPACE" "$WORKSPACE" \
   \
