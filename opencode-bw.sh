@@ -6,70 +6,35 @@
 
 set -euo pipefail
 
-WORKSPACE="$HOME/local_dev"
-STARTDIR="$(pwd)"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+source "$SCRIPT_DIR/bw-common.sh"
 
-# Verify we're inside ~/local_dev
-case "$STARTDIR" in
-  "$WORKSPACE"|"$WORKSPACE"/*)
-    ;;
-  *)
-    echo "Error: Must be run from within $WORKSPACE"
-    echo "Current directory: $STARTDIR"
-    exit 1
-    ;;
-esac
+# Tool-specific binds (added to common)
+BINDS=(
+  "${COMMON_BINDS[@]}"
 
-# Ensure OpenCode dirs exist (bwrap fails on missing bind sources)
-mkdir -p "$HOME/.config/opencode"
-mkdir -p "$HOME/.local/share/opencode"
-mkdir -p "$HOME/.cache/opencode"
+  # OpenCode config/data/cache — rw! creates if missing
+  "rw! $HOME/.config/opencode"
+  "rw! $HOME/.local/share/opencode"
+  "rw! $HOME/.cache/opencode"
+)
+
+build_bwrap_args
 
 exec bwrap \
-  --ro-bind /usr /usr \
-  --ro-bind /lib /lib \
-  --ro-bind /lib64 /lib64 \
-  --ro-bind /bin /bin \
-  --ro-bind /sbin /sbin \
-  --ro-bind /etc /etc \
+  "${BWRAP_ARGS[@]}" \
   --proc /proc \
   --dev /dev \
   --tmpfs /tmp \
   --tmpfs /run \
-  \
-  `# Docker: bind socket + fix /var/run symlink so docker CLI finds it` \
   --bind /run/docker.sock /run/docker.sock \
   --ro-bind /run/systemd /run/systemd \
   --symlink /run /var/run \
-  \
-  `# Linuxbrew (opencode, rg live here)` \
-  --ro-bind /home/linuxbrew /home/linuxbrew \
-  \
-  `# Workspace — the ONLY writable project area` \
-  --bind "$WORKSPACE" "$WORKSPACE" \
-  \
-  `# OpenCode config — needs read-write` \
-  --bind "$HOME/.config/opencode" "$HOME/.config/opencode" \
-  \
-  `# OpenCode data — sessions, auth, snapshots — needs read-write` \
-  --bind "$HOME/.local/share/opencode" "$HOME/.local/share/opencode" \
-  \
-  `# OpenCode cache — models, bun cache — needs read-write` \
-  --bind "$HOME/.cache/opencode" "$HOME/.cache/opencode" \
-  \
-  `# Git config — read-only` \
-  --ro-bind "$HOME/.gitconfig" "$HOME/.gitconfig" \
-  --ro-bind "$HOME/.config/git" "$HOME/.config/git" \
-  --ro-bind "$HOME/python3.14" "$HOME/python3.14" \
-  \
   --setenv HOME "$HOME" \
   --setenv PATH "/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
   --setenv SHELL /bin/bash \
   --chdir "$STARTDIR" \
-  \
-  `# Isolate IPC/PID/UTS/cgroup but NOT user namespace (preserves docker group)` \
   --unshare-ipc \
   --unshare-pid \
   --die-with-parent \
-  \
   opencode "$@"
