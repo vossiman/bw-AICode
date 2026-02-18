@@ -26,6 +26,7 @@ build_bwrap_args
 
 TMUX_DIR="/tmp/tmux-$(id -u)"
 mkdir -p "$TMUX_DIR"
+chmod 700 "$TMUX_DIR"
 
 exec bwrap \
   "${BWRAP_ARGS[@]}" \
@@ -42,6 +43,7 @@ exec bwrap \
   --setenv SHELL /bin/bash \
   --setenv CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS 1 \
   --setenv CLAUDE_CODE_DISABLE_AUTO_MEMORY 0 \
+  --setenv CLAUDE_CODE_SPAWN_BACKEND "tmux" \
   --chdir "$STARTDIR" \
   --unshare-ipc \
   --unshare-pid \
