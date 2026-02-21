@@ -39,8 +39,10 @@ exec bwrap \
   --symlink /run /var/run \
   --bind "$TMUX_DIR" "$TMUX_DIR" \
   --setenv HOME "$HOME" \
-  --setenv PATH "/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
+  --setenv PATH "$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
   --setenv SHELL /bin/bash \
+  ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"} \
+  ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"} \
   --setenv CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS 1 \
   --setenv CLAUDE_CODE_DISABLE_AUTO_MEMORY 0 \
   --setenv CLAUDE_CODE_SPAWN_BACKEND "tmux" \

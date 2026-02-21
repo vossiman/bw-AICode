@@ -31,8 +31,10 @@ exec bwrap \
   --ro-bind /run/systemd /run/systemd \
   --symlink /run /var/run \
   --setenv HOME "$HOME" \
-  --setenv PATH "/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
+  --setenv PATH "$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
   --setenv SHELL /bin/bash \
+  ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"} \
+  ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"} \
   --chdir "$STARTDIR" \
   --unshare-ipc \
   --unshare-pid \

@@ -36,9 +36,15 @@ COMMON_BINDS=(
   # Workspace — the ONLY writable project area
   "rw $WORKSPACE"
 
-  # Git config
+  # Git config + SSH keys (read-only — push needs key access)
   "ro $HOME/.gitconfig"
   "ro $HOME/.config/git"
+  "ro $HOME/.ssh"
+
+  # Node / npm / pnpm
+  "ro $HOME/.npm-global"
+  "ro $HOME/.npmrc"
+  "rw $HOME/.local/share/pnpm"
 
   # Python / uv
   "ro $HOME/python3.14"
