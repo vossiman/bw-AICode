@@ -19,7 +19,13 @@ BINDS=(
   "rw! $HOME/.cache/opencode"
 )
 
-build_bwrap_args
+# Overlay binds — placed after --tmpfs /tmp and --tmpfs /run
+OVERLAY_BINDS=(
+  "${COMMON_OVERLAY_BINDS[@]}"
+)
+
+build_bwrap_args BINDS BWRAP_ARGS
+build_bwrap_args OVERLAY_BINDS BWRAP_OVERLAY_ARGS
 
 exec bwrap \
   "${BWRAP_ARGS[@]}" \
@@ -27,11 +33,10 @@ exec bwrap \
   --dev /dev \
   --tmpfs /tmp \
   --tmpfs /run \
-  --bind /run/docker.sock /run/docker.sock \
-  --ro-bind /run/systemd /run/systemd \
+  "${BWRAP_OVERLAY_ARGS[@]}" \
   --symlink /run /var/run \
   --setenv HOME "$HOME" \
-  --setenv PATH "$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
+  --setenv PATH "$HOME/.local/bin:$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
   --setenv SHELL /bin/bash \
   ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"} \
   ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"} \

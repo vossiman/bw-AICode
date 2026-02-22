@@ -13,6 +13,9 @@ source "$SCRIPT_DIR/bw-common.sh"
 BINDS=(
   "${COMMON_BINDS[@]}"
 
+  # Claude CLI installation (binary + versions)
+  "ro $HOME/.local/share/claude"
+
   # Claude Code config
   "rw $HOME/.claude"
   "rw $HOME/.claude.json"
@@ -22,11 +25,16 @@ BINDS=(
   "ro $HOME/.config/Claude"
 )
 
-build_bwrap_args
+# Overlay binds — placed after --tmpfs /tmp and --tmpfs /run
+OVERLAY_BINDS=(
+  "${COMMON_OVERLAY_BINDS[@]}"
 
-TMUX_DIR="/tmp/tmux-$(id -u)"
-mkdir -p "$TMUX_DIR"
-chmod 700 "$TMUX_DIR"
+  # tmux socket dir — isolated from host sessions via TMUX_TMPDIR
+  "rw!700 /tmp/tmux-claude-$(id -u)"
+)
+
+build_bwrap_args BINDS BWRAP_ARGS
+build_bwrap_args OVERLAY_BINDS BWRAP_OVERLAY_ARGS
 
 exec bwrap \
   "${BWRAP_ARGS[@]}" \
@@ -34,17 +42,16 @@ exec bwrap \
   --dev /dev \
   --tmpfs /tmp \
   --tmpfs /run \
-  --bind /run/docker.sock /run/docker.sock \
-  --ro-bind /run/systemd /run/systemd \
+  "${BWRAP_OVERLAY_ARGS[@]}" \
   --symlink /run /var/run \
-  --bind "$TMUX_DIR" "$TMUX_DIR" \
   --setenv HOME "$HOME" \
-  --setenv PATH "$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
+  --setenv PATH "$HOME/.local/bin:$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
   --setenv SHELL /bin/bash \
   ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"} \
   ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"} \
   --setenv CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS 1 \
   --setenv CLAUDE_CODE_DISABLE_AUTO_MEMORY 0 \
+  --setenv TMUX_TMPDIR "/tmp/tmux-claude-$(id -u)" \
   --setenv CLAUDE_CODE_SPAWN_BACKEND "tmux" \
   --chdir "$STARTDIR" \
   --unshare-ipc \

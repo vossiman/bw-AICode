@@ -8,7 +8,7 @@ Bubblewrap (`bwrap`) sandbox wrappers for AI coding tools. Runs Claude Code and 
 - `~/local_dev` is the **only writable project area**
 - Tool-specific config/state dirs mounted read-write as needed
 - IPC/PID namespaces isolated (user namespace preserved for docker group)
-- Docker socket and tmux socket bound through for container and multiplexer access
+- Docker socket and tmux socket bound through for container and multiplexer access (conditionally — skipped if not present)
 
 ## Scripts
 
@@ -53,6 +53,12 @@ Format: `"mode source [dest]"`
 |---|---|
 | `ro` | Read-only bind. Skipped if source doesn't exist. |
 | `rw` | Read-write bind. Skipped if source doesn't exist. |
-| `rw!` | Read-write bind. Creates source directory if missing. |
+| `rw!` | Read-write bind. Creates source directory if missing (`mkdir -p`). |
+| `rw!PERM` | Read-write bind. Creates source directory + `chmod PERM` (e.g. `rw!700`). |
 
-To add a shared bind, edit `COMMON_BINDS` in `bw-common.sh`. To add a tool-specific bind, edit the `BINDS` array in the relevant wrapper script.
+There are two bind arrays:
+
+- **`BINDS`** / **`COMMON_BINDS`** — Regular binds, placed before `--tmpfs`. For paths outside `/tmp` and `/run`.
+- **`OVERLAY_BINDS`** / **`COMMON_OVERLAY_BINDS`** — Overlay binds, placed *after* `--tmpfs /tmp` and `--tmpfs /run` in the bwrap command. Required for paths under `/tmp` or `/run`, since the tmpfs would otherwise hide them.
+
+To add a shared bind, edit `COMMON_BINDS` or `COMMON_OVERLAY_BINDS` in `bw-common.sh`. To add a tool-specific bind, edit the `BINDS` or `OVERLAY_BINDS` array in the relevant wrapper script.

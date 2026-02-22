@@ -19,11 +19,12 @@ Both scripts share the same pattern:
 3. Mount `~/local_dev` as the **only writable project area**
 4. Mount tool-specific config/state dirs read-write (e.g., `~/.claude`, `~/.config/opencode`)
 5. Isolate IPC/PID namespaces but **not** user namespace (preserves docker group membership)
-6. Bind Docker socket and tmux socket for container and multiplexer access
+6. Bind Docker socket and tmux socket for container and multiplexer access (conditionally — skipped if not present on the host)
 
 ## Editing Guidelines
 
 - These are `bash` scripts using `set -euo pipefail` — maintain strict error handling.
 - When adding new bind mounts, decide read-only (`--ro-bind`) vs read-write (`--bind`) based on whether the tool needs to write there.
-- If a bind source directory might not exist, `mkdir -p` it before the `bwrap` call (see `opencode-bw` for the pattern).
+- If a bind source directory might not exist, use `rw!` mode so `build_bwrap_args` creates it. Use `rw!PERM` (e.g. `rw!700`) to also set permissions.
+- Binds targeting paths under `/tmp` or `/run` must go in the `OVERLAY_BINDS` array (placed after `--tmpfs` in the bwrap command), not `BINDS`.
 - Both scripts use `exec bwrap` — the shell process is replaced, so nothing runs after the bwrap invocation.
