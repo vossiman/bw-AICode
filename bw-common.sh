@@ -62,10 +62,8 @@ COMMON_BINDS=(
 # These target paths under /tmp or /run and must be placed AFTER --tmpfs /tmp
 # and --tmpfs /run in the bwrap command, otherwise the tmpfs hides them.
 COMMON_OVERLAY_BINDS=(
-  # Docker socket — skip if docker not installed
-  # SECURITY: RW docker socket is a sandbox escape (docker run -v /:/host).
-  # Needed for container workflows. Restrict to ro if only inspecting.
-  "rw /run/docker.sock"
+  # Docker API: accessed via socket-proxy (tcp://127.0.0.1:2375), not raw socket.
+  # See docker-compose.yml. Start with: docker compose up -d
 
   # systemd runtime — skip if not present
   "ro /run/systemd"
@@ -95,4 +93,23 @@ build_bwrap_args() {
       rw|rw!*) _args+=(--bind "$src" "$dest") ;;
     esac
   done
+}
+
+# Parse bw-AICode flags from arguments.
+# Sets: BW_FULL_DOCKER (bool), BW_DOCKER_HOST (env value), BW_TOOL_ARGS (passthrough)
+parse_bw_flags() {
+  BW_FULL_DOCKER=false
+  BW_TOOL_ARGS=()
+  for arg in "$@"; do
+    case "$arg" in
+      --full-docker) BW_FULL_DOCKER=true ;;
+      *) BW_TOOL_ARGS+=("$arg") ;;
+    esac
+  done
+
+  if [[ "$BW_FULL_DOCKER" == true ]]; then
+    BW_DOCKER_HOST="unix:///var/run/docker.sock"
+  else
+    BW_DOCKER_HOST="tcp://127.0.0.1:2375"
+  fi
 }

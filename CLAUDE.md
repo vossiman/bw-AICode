@@ -19,7 +19,8 @@ Both scripts share the same pattern:
 3. Mount `~/local_dev` as the **only writable project area**
 4. Mount tool-specific config/state dirs read-write (e.g., `~/.claude`, `~/.config/opencode`)
 5. Isolate IPC/PID namespaces but **not** user namespace (preserves docker group membership)
-6. Bind Docker socket and tmux socket for container and multiplexer access (conditionally — skipped if not present on the host)
+6. Docker API via read-only socket proxy (`docker-compose.yml`) — raw socket is **not** mounted
+7. Tmux socket isolated from host sessions via separate `TMUX_TMPDIR`
 
 ## Editing Guidelines
 

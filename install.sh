@@ -42,7 +42,7 @@ ok "$BIN_DIR"
 
 # --- Step 2: Symlink wrappers ---
 step "Installing wrappers"
-for script in claude-bw.sh opencode-bw.sh; do
+for script in claude-bw.sh opencode-bw.sh bw-docker-proxy.sh; do
   name="${script%.sh}"
   target="$SCRIPT_DIR/$script"
   link="$BIN_DIR/$name"
@@ -89,6 +89,12 @@ else
   warn "opencode not found — install OpenCode before using opencode-bw"
 fi
 
+if command -v docker &>/dev/null; then
+  ok "docker found at $(command -v docker)"
+else
+  warn "docker not found — needed for bw-docker-proxy"
+fi
+
 echo ""
-echo -e "  ${GREEN}${BOLD}Done.${RESET} Run ${CYAN}claude-bw${RESET} or ${CYAN}opencode-bw${RESET} from inside ${BOLD}~/local_dev${RESET}"
+echo -e "  ${GREEN}${BOLD}Done.${RESET} Run ${CYAN}bw-docker-proxy up -d${RESET} then ${CYAN}claude-bw${RESET} or ${CYAN}opencode-bw${RESET} from inside ${BOLD}~/local_dev${RESET}"
 echo ""

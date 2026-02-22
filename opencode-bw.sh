@@ -8,6 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "$SCRIPT_DIR/bw-common.sh"
+parse_bw_flags "$@"
 
 # Tool-specific binds (added to common)
 BINDS=(
@@ -23,6 +24,10 @@ BINDS=(
 OVERLAY_BINDS=(
   "${COMMON_OVERLAY_BINDS[@]}"
 )
+
+if [[ "$BW_FULL_DOCKER" == true ]]; then
+  OVERLAY_BINDS+=("rw /run/docker.sock")
+fi
 
 build_bwrap_args BINDS BWRAP_ARGS
 build_bwrap_args OVERLAY_BINDS BWRAP_OVERLAY_ARGS
@@ -40,8 +45,9 @@ exec bwrap \
   --setenv SHELL /bin/bash \
   ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"} \
   ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"} \
+  --setenv DOCKER_HOST "$BW_DOCKER_HOST" \
   --chdir "$STARTDIR" \
   --unshare-ipc \
   --unshare-pid \
   --die-with-parent \
-  opencode "$@"
+  opencode "${BW_TOOL_ARGS[@]}"

@@ -8,6 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "$SCRIPT_DIR/bw-common.sh"
+parse_bw_flags "$@"
 
 # Tool-specific binds (added to common)
 BINDS=(
@@ -33,6 +34,10 @@ OVERLAY_BINDS=(
   "rw!700 /tmp/tmux-claude-$(id -u)"
 )
 
+if [[ "$BW_FULL_DOCKER" == true ]]; then
+  OVERLAY_BINDS+=("rw /run/docker.sock")
+fi
+
 build_bwrap_args BINDS BWRAP_ARGS
 build_bwrap_args OVERLAY_BINDS BWRAP_OVERLAY_ARGS
 
@@ -53,8 +58,9 @@ exec bwrap \
   --setenv CLAUDE_CODE_DISABLE_AUTO_MEMORY 0 \
   --setenv TMUX_TMPDIR "/tmp/tmux-claude-$(id -u)" \
   --setenv CLAUDE_CODE_SPAWN_BACKEND "tmux" \
+  --setenv DOCKER_HOST "$BW_DOCKER_HOST" \
   --chdir "$STARTDIR" \
   --unshare-ipc \
   --unshare-pid \
   --die-with-parent \
-  claude --dangerously-skip-permissions "$@"
+  claude --dangerously-skip-permissions "${BW_TOOL_ARGS[@]}"
