@@ -50,10 +50,11 @@ exec bwrap \
   "${BWRAP_OVERLAY_ARGS[@]}" \
   --symlink /run /var/run \
   --setenv HOME "$HOME" \
-  --setenv PATH "$HOME/.local/bin:$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
+  --setenv PATH "${BW_VENV_PATH:+$BW_VENV_PATH/bin:}$HOME/.local/bin:$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
   --setenv SHELL /bin/bash \
   ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"} \
   ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"} \
+  ${BW_VENV_PATH:+--setenv VIRTUAL_ENV "$BW_VENV_PATH"} \
   --setenv CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS 1 \
   --setenv CLAUDE_CODE_DISABLE_AUTO_MEMORY 0 \
   --setenv TMUX_TMPDIR "/tmp/tmux-claude-$(id -u)" \

@@ -4,6 +4,12 @@
 WORKSPACE="$HOME/local_dev"
 STARTDIR="$(pwd)"
 
+# Auto-detect local virtualenv (.venv) in the current directory
+BW_VENV_PATH=""
+if [[ -x "$STARTDIR/.venv/bin/python" ]]; then
+  BW_VENV_PATH="$STARTDIR/.venv"
+fi
+
 # Verify we're inside ~/local_dev
 case "$STARTDIR" in
   "$WORKSPACE"|"$WORKSPACE"/*)

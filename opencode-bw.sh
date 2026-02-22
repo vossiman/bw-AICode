@@ -41,10 +41,11 @@ exec bwrap \
   "${BWRAP_OVERLAY_ARGS[@]}" \
   --symlink /run /var/run \
   --setenv HOME "$HOME" \
-  --setenv PATH "$HOME/.local/bin:$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
+  --setenv PATH "${BW_VENV_PATH:+$BW_VENV_PATH/bin:}$HOME/.local/bin:$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
   --setenv SHELL /bin/bash \
   ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"} \
   ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"} \
+  ${BW_VENV_PATH:+--setenv VIRTUAL_ENV "$BW_VENV_PATH"} \
   --setenv DOCKER_HOST "$BW_DOCKER_HOST" \
   --chdir "$STARTDIR" \
   --unshare-ipc \
