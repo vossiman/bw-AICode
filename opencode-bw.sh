@@ -2,7 +2,7 @@
 # opencode-bw — Run OpenCode sandboxed via bubblewrap
 # Must be run from within ~/local_dev or a subdirectory.
 # Writable: ~/local_dev only. Everything else is read-only or invisible.
-# OpenCode allows all operations by default — no skip-permissions flag needed.
+# Runs with OPENCODE_PERMISSION=allow (safe because bwrap enforces the sandbox).
 
 set -euo pipefail
 
@@ -46,6 +46,7 @@ exec bwrap \
   ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"} \
   ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"} \
   ${BW_VENV_PATH:+--setenv VIRTUAL_ENV "$BW_VENV_PATH"} \
+  --setenv OPENCODE_PERMISSION '{"*":"allow"}' \
   --setenv DOCKER_HOST "$BW_DOCKER_HOST" \
   --chdir "$STARTDIR" \
   --unshare-ipc \
