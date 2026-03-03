@@ -115,6 +115,18 @@ parse_bw_flags() {
 
   if [[ "$BW_FULL_DOCKER" == true ]]; then
     BW_DOCKER_HOST="unix:///var/run/docker.sock"
+
+    # WSL2: /usr/bin/docker may be a symlink into /mnt/wsl/docker-desktop/...
+    # which isn't mounted by default. Bind-mount the resolved target so the
+    # Docker CLI works inside the sandbox.
+    local docker_bin="/usr/bin/docker"
+    if [[ -L "$docker_bin" ]]; then
+      local real_docker
+      real_docker="$(readlink -f "$docker_bin" 2>/dev/null)" || true
+      if [[ -n "$real_docker" && -e "$real_docker" && "$real_docker" != "$docker_bin" ]]; then
+        COMMON_BINDS+=("ro $real_docker")
+      fi
+    fi
   else
     BW_DOCKER_HOST="tcp://127.0.0.1:2375"
   fi
