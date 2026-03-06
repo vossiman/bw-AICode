@@ -59,6 +59,9 @@ COMMON_BINDS=(
   "ro $HOME/.npmrc"
   "rw $HOME/.local/share/pnpm"
 
+  # Playwright browsers (read-only — install/update outside sandbox)
+  "ro $HOME/.cache/ms-playwright"
+
   # Python / uv
   "ro $HOME/python3.14"
   "ro $HOME/.local/share/uv"
