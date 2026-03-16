@@ -112,29 +112,72 @@ The AI tool spawns `docker run -i --rm` as a child process, communicates with th
 
 This is fundamentally different from a long-running service — you **cannot** pre-start MCP containers outside the sandbox and have the AI tool connect to them later, because the stdio transport requires the AI tool to be the parent process of the container.
 
-**Consequence:** If your project uses Docker-based MCPs, you must use `--full-docker`:
+**Consequence:** If your project uses Docker-based MCPs, the guard proxy automatically detects them and allows the required `docker run` operations. No flags needed.
 
-```bash
-claude-bw --full-docker     # for projects with Docker-based MCPs
+## bw-docker-guard: the allowlist proxy
+
+`bw-docker-guard` is a Go HTTP reverse proxy that sits between the sandbox and the Docker socket, replacing the linuxserver/socket-proxy. It provides a meaningful middle ground by inspecting Docker API request bodies and enforcing a derived allowlist.
+
+### Three Docker modes (auto-selected)
+
+| Project has | Mode | How it works |
+|---|---|---|
+| No compose file or Docker MCPs | **Read-only** | `bw-docker-guard` with empty allowlist — all writes blocked |
+| `docker-compose.yml` or Docker MCPs | **Guarded** | `bw-docker-guard` with derived allowlist — scoped Docker access |
+| `--full-docker` flag | **Unrestricted** | Raw Docker socket mounted — no proxy |
+
+### Allowlist derivation
+
+At launch, the wrapper script scans the project directory and generates an allowlist. The allowlist is **locked for the session** — if the AI modifies config files during the session, the allowlist does not change.
+
+Sources scanned:
+- Docker Compose files (`docker-compose.yml`, `compose.yml`, etc.) — resolved via `docker compose config`
+- MCP server configs (`.mcp.json`, `.claude/settings.local.json`, `claude_desktop_config.json`) — Docker-based entries
+
+From these, the proxy extracts: allowed images, allowed networks, compose project name.
+
+### Security enforcement
+
+The proxy is **deny-by-default**. Only explicitly modeled operations are allowed:
+
+- **Read operations** (GET/HEAD): always allowed
+- **Container create**: image must be in allowlist, volume mounts must be under project directory, dangerous flags blocked (`--privileged`, `--pid=host`, `--network=host`, `--cap-add`, `--device`)
+- **Container lifecycle** (start/stop/restart/kill/exec/rm): only on containers owned by this session (created through the proxy or belonging to the compose project)
+- **Image pull**: only allowlisted images
+- **Network create/delete**: only allowlisted networks
+- **Everything else**: blocked (Swarm, secrets, plugins, volume create, etc.)
+
+### What the guard blocks
+
+| Escape vector | How it's blocked |
+|---|---|
+| Arbitrary volume mount (`-v /:/host`) | Only mounts under project directory allowed |
+| Privileged container | `Privileged` flag rejected in request body |
+| Host PID/network namespace | `PidMode: host`, `NetworkMode: host` rejected |
+| Arbitrary image | Only allowlisted images can be pulled or used |
+| Capability escalation | `CapAdd` rejected |
+| Device access | `Devices` rejected |
+| Exec into non-project container | Container ownership tracking |
+| Docker socket in container | Mount of `docker.sock` rejected |
+
+### What it doesn't protect against
+
+- Supply-chain attacks (malicious upstream MCP images)
+- Network exfiltration from allowed containers (same risk as the AI tool itself having network access)
+- Bugs in the proxy implementation (mitigated by deny-by-default and comprehensive tests)
+
+### Architecture
+
+Each session gets its own `bw-docker-guard` instance:
+
+```
+Wrapper script starts
+  ├── Derives allowlist from project config
+  ├── Starts bw-docker-guard on /tmp/bw-docker-guard-$$.sock
+  ├── Bind-mounts the socket into the bwrap sandbox
+  ├── Sets DOCKER_HOST=unix:///run/bw-docker-guard.sock
+  └── Runs bwrap (AI tool session)
+      └── On exit: kills bw-docker-guard, cleans up socket
 ```
 
-## Current decision: `--full-docker` for Docker-dependent workflows
-
-The chosen approach is:
-
-- **Default mode (proxy)** for projects that don't need Docker write access — maximum security
-- **`--full-docker` flag** for projects that need `docker run` (MCPs, dev containers, etc.) — accepts the security tradeoff explicitly
-
-This is honest about the security model: either Docker is read-only, or it's fully accessible. There is no useful middle ground with the current proxy architecture.
-
-## Future option: allowlist wrapper
-
-A stronger solution would be a host-side helper service that:
-
-1. Accepts `docker run` requests from the sandbox
-2. Validates the image against an allowlist (e.g., only `mcp/postgres`, `mcp/sqlite`)
-3. Validates volume mounts against a path allowlist (e.g., only paths under `~/local_dev`)
-4. Rejects `--privileged`, `--pid=host`, `--network=host`, and other escape-enabling flags
-5. Delegates approved requests to the real Docker socket
-
-This would give MCP support with actual security guarantees — the AI tool could run approved containers but couldn't use Docker as an escape vector. This is not currently implemented.
+The proxy is ephemeral — starts with the session, dies with the session. No persistent service to manage.

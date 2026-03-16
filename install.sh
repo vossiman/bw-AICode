@@ -15,7 +15,7 @@ CYAN='\033[0;36m'
 RESET='\033[0m'
 
 step=0
-total=4
+total=5
 
 header() {
   echo ""
@@ -42,7 +42,7 @@ ok "$BIN_DIR"
 
 # --- Step 2: Symlink wrappers ---
 step "Installing wrappers"
-for script in claude-bw.sh opencode-bw.sh bw-docker-proxy.sh; do
+for script in claude-bw.sh opencode-bw.sh; do
   name="${script%.sh}"
   target="$SCRIPT_DIR/$script"
   link="$BIN_DIR/$name"
@@ -60,7 +60,25 @@ for script in claude-bw.sh opencode-bw.sh bw-docker-proxy.sh; do
   fi
 done
 
-# --- Step 3: Verify PATH ---
+# Remove old bw-docker-proxy symlink if present
+if [[ -L "$BIN_DIR/bw-docker-proxy" ]]; then
+  rm "$BIN_DIR/bw-docker-proxy"
+  ok "bw-docker-proxy ${DIM}removed (replaced by bw-docker-guard)${RESET}"
+fi
+
+# --- Step 3: Build bw-docker-guard ---
+step "Building bw-docker-guard"
+if command -v go &>/dev/null; then
+  if (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/bw-docker-guard" ./cmd/bw-docker-guard 2>&1); then
+    ok "bw-docker-guard ${DIM}built and installed${RESET}"
+  else
+    err "bw-docker-guard build failed"
+  fi
+else
+  err "go not found — needed to build bw-docker-guard (install Go 1.22+)"
+fi
+
+# --- Step 4: Verify PATH ---
 step "Checking PATH"
 if [[ ":$PATH:" == *":$BIN_DIR:"* ]]; then
   ok "$BIN_DIR is in PATH"
@@ -68,7 +86,7 @@ else
   warn "$BIN_DIR is not in PATH — add it to your shell profile"
 fi
 
-# --- Step 4: Checking dependencies ---
+# --- Step 5: Checking dependencies ---
 step "Checking dependencies"
 
 if command -v bwrap &>/dev/null; then
@@ -92,9 +110,21 @@ fi
 if command -v docker &>/dev/null; then
   ok "docker found at $(command -v docker)"
 else
-  warn "docker not found — needed for bw-docker-proxy"
+  warn "docker not found — needed for Docker-based MCP servers and compose workflows"
+fi
+
+if command -v jq &>/dev/null; then
+  ok "jq found at $(command -v jq)"
+else
+  warn "jq not found — needed for Docker allowlist derivation"
+fi
+
+if command -v go &>/dev/null; then
+  ok "go $(go version 2>/dev/null | awk '{print $3}' || echo '')"
+else
+  warn "go not found — needed to build bw-docker-guard"
 fi
 
 echo ""
-echo -e "  ${GREEN}${BOLD}Done.${RESET} Run ${CYAN}bw-docker-proxy up -d${RESET} then ${CYAN}claude-bw${RESET} or ${CYAN}opencode-bw${RESET} from inside ${BOLD}~/local_dev${RESET}"
+echo -e "  ${GREEN}${BOLD}Done.${RESET} Run ${CYAN}claude-bw${RESET} or ${CYAN}opencode-bw${RESET} from inside ${BOLD}~/local_dev${RESET}"
 echo ""
