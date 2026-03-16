@@ -1,2 +1,3 @@
 *.exe
 /bw-docker-guard
+test/bw-docker-guard-test
