@@ -68,8 +68,8 @@ COMMON_BINDS=(
 # These target paths under /tmp or /run and must be placed AFTER --tmpfs /tmp
 # and --tmpfs /run in the bwrap command, otherwise the tmpfs hides them.
 COMMON_OVERLAY_BINDS=(
-  # Docker API: accessed via socket-proxy (tcp://127.0.0.1:2375), not raw socket.
-  # See docker-compose.yml. Start with: docker compose up -d
+  # Docker API: accessed via bw-docker-guard proxy (Unix socket) or raw socket
+  # (--full-docker). The guard socket is added dynamically by start_docker_guard().
 
   # systemd runtime — skip if not present
   "ro /run/systemd"
@@ -101,8 +101,171 @@ build_bwrap_args() {
   done
 }
 
+# --- Docker allowlist derivation ---
+# Scans the project directory for Docker Compose files and Docker-based MCP
+# server configs. Produces a JSON allowlist for bw-docker-guard.
+# Sets: BW_DOCKER_MODE ("guarded"|"readonly"), BW_DOCKER_GUARD_CONFIG (path)
+derive_docker_allowlist() {
+  local images=() networks=() compose_project=""
+
+  # --- Source 1: Docker Compose files ---
+  local compose_file=""
+  for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+    if [[ -f "$STARTDIR/$f" ]]; then
+      compose_file="$STARTDIR/$f"
+      break
+    fi
+  done
+
+  if [[ -n "$compose_file" ]]; then
+    compose_project="$(basename "$STARTDIR")"
+
+    # Use docker compose config to resolve interpolation, extends, etc.
+    local resolved
+    if resolved="$(docker compose -f "$compose_file" config --format json 2>/dev/null)"; then
+      # Extract service images
+      local compose_images
+      compose_images="$(echo "$resolved" | jq -r '.services // {} | to_entries[] | .value.image // empty' 2>/dev/null)"
+      while IFS= read -r img; do
+        [[ -n "$img" ]] && images+=("$img")
+      done <<< "$compose_images"
+
+      # Extract network names
+      local compose_networks
+      compose_networks="$(echo "$resolved" | jq -r '.networks // {} | keys[]' 2>/dev/null)"
+      while IFS= read -r net; do
+        [[ -n "$net" ]] && networks+=("${compose_project}_${net}")
+      done <<< "$compose_networks"
+    fi
+  fi
+
+  # --- Source 2: MCP server configs (Docker-based entries) ---
+  # Extracts image names from MCP entries with "command": "docker"
+  _extract_mcp_docker_images() {
+    local file="$1"
+    [[ -f "$file" ]] || return
+    # Find entries where command is "docker", extract the image from args.
+    # The image is the first arg that isn't a flag (doesn't start with -)
+    # and isn't a flag value (not preceded by a flag that takes a value).
+    local mcp_images
+    mcp_images="$(jq -r '
+      (.mcpServers // {}) | to_entries[] |
+      select(.value.command == "docker") |
+      .value.args // [] |
+      # Walk args: skip "run" and flags, find the image
+      reduce .[] as $arg (
+        {state: "scanning", image: null};
+        if .image != null then .
+        elif .state == "skip_next" then .state = "scanning"
+        elif $arg == "run" then .state = "scanning"
+        elif ($arg | test("^--?[a-zA-Z]")) then
+          # Flags that take a value: skip the next arg
+          if ($arg | test("^--(network|name|env|volume|workdir|user|entrypoint|label|mount|publish|expose|hostname|domainname|memory|cpus|platform|pull|runtime|security-opt|ulimit|log-driver|log-opt|pid|uts|ipc|cgroupns|restart|stop-signal|stop-timeout)=")) then .
+          elif ($arg | test("^-[evpw]$")) then {state: "skip_next", image: null}
+          elif ($arg | test("^--(network|name|env|volume|workdir|user|entrypoint|label|mount|publish|expose|hostname)$")) then {state: "skip_next", image: null}
+          else .
+          end
+        elif ($arg | test("^-")) then .
+        else {state: "done", image: $arg}
+        end
+      ) | .image // empty
+    ' "$file" 2>/dev/null)"
+    while IFS= read -r img; do
+      [[ -n "$img" ]] && images+=("$img")
+    done <<< "$mcp_images"
+  }
+
+  # Check per-project MCP configs
+  _extract_mcp_docker_images "$STARTDIR/.mcp.json"
+  _extract_mcp_docker_images "$STARTDIR/.claude/settings.local.json"
+
+  # Check global Claude desktop config
+  _extract_mcp_docker_images "$HOME/.config/Claude/claude_desktop_config.json"
+
+  # --- Deduplicate ---
+  local unique_images=() unique_networks=()
+  local -A seen_img seen_net
+  for img in "${images[@]}"; do
+    if [[ -z "${seen_img[$img]:-}" ]]; then
+      unique_images+=("$img")
+      seen_img[$img]=1
+    fi
+  done
+  for net in "${networks[@]}"; do
+    if [[ -z "${seen_net[$net]:-}" ]]; then
+      unique_networks+=("$net")
+      seen_net[$net]=1
+    fi
+  done
+
+  # --- Determine mode ---
+  if (( ${#unique_images[@]} > 0 )); then
+    BW_DOCKER_MODE="guarded"
+  else
+    BW_DOCKER_MODE="readonly"
+  fi
+
+  # --- Write JSON config ---
+  BW_DOCKER_GUARD_CONFIG="$(mktemp /tmp/bw-docker-guard-XXXXXX.json)"
+
+  local images_json networks_json
+  images_json="$(printf '%s\n' "${unique_images[@]}" | jq -R . | jq -s .)"
+  if (( ${#unique_networks[@]} > 0 )); then
+    networks_json="$(printf '%s\n' "${unique_networks[@]}" | jq -R . | jq -s .)"
+  else
+    networks_json="[]"
+  fi
+
+  jq -n \
+    --arg project_dir "$STARTDIR" \
+    --arg compose_project "$compose_project" \
+    --argjson images "$images_json" \
+    --argjson networks "$networks_json" \
+    --arg volume_mount_root "$STARTDIR" \
+    '{
+      project_dir: $project_dir,
+      compose_project: $compose_project,
+      allowed_images: $images,
+      allowed_networks: $networks,
+      volume_mount_root: $volume_mount_root
+    }' > "$BW_DOCKER_GUARD_CONFIG"
+}
+
+# --- Docker guard lifecycle ---
+# Start bw-docker-guard proxy. Sets BW_GUARD_PID, BW_GUARD_SOCKET, BW_DOCKER_HOST.
+start_docker_guard() {
+  BW_GUARD_SOCKET="/tmp/bw-docker-guard-$$.sock"
+  bw-docker-guard \
+    --config "$BW_DOCKER_GUARD_CONFIG" \
+    --socket "$BW_GUARD_SOCKET" &
+  BW_GUARD_PID=$!
+
+  # Wait for socket to appear (up to 1 second)
+  local i
+  for i in {1..20}; do
+    [[ -S "$BW_GUARD_SOCKET" ]] && break
+    sleep 0.05
+  done
+
+  if [[ ! -S "$BW_GUARD_SOCKET" ]]; then
+    echo "Error: bw-docker-guard failed to start" >&2
+    kill "$BW_GUARD_PID" 2>/dev/null
+    exit 1
+  fi
+
+  # Inside the sandbox, the socket is bind-mounted to a fixed path
+  BW_DOCKER_HOST="unix:///run/bw-docker-guard.sock"
+}
+
+cleanup_docker_guard() {
+  [[ -n "${BW_GUARD_PID:-}" ]] && kill "$BW_GUARD_PID" 2>/dev/null
+  [[ -n "${BW_GUARD_SOCKET:-}" ]] && rm -f "$BW_GUARD_SOCKET"
+  [[ -n "${BW_DOCKER_GUARD_CONFIG:-}" ]] && rm -f "$BW_DOCKER_GUARD_CONFIG"
+}
+
 # Parse bw-AICode flags from arguments.
-# Sets: BW_FULL_DOCKER (bool), BW_DOCKER_HOST (env value), BW_TOOL_ARGS (passthrough)
+# Sets: BW_FULL_DOCKER (bool), BW_DOCKER_HOST (env value), BW_TOOL_ARGS (passthrough),
+#       BW_DOCKER_MODE ("guarded"|"readonly"|"full"), BW_GUARD_PID, BW_GUARD_SOCKET
 parse_bw_flags() {
   BW_FULL_DOCKER=false
   BW_TOOL_ARGS=()
@@ -115,6 +278,7 @@ parse_bw_flags() {
 
   if [[ "$BW_FULL_DOCKER" == true ]]; then
     BW_DOCKER_HOST="unix:///var/run/docker.sock"
+    BW_DOCKER_MODE="full"
 
     # WSL2: Docker Desktop symlinks binaries and CLI plugins from /usr into
     # /mnt/wsl/docker-desktop/cli-tools/... which isn't mounted by default.
@@ -125,6 +289,8 @@ parse_bw_flags() {
       COMMON_BINDS+=("ro $wsl_cli_tools")
     fi
   else
-    BW_DOCKER_HOST="tcp://127.0.0.1:2375"
+    # Derive allowlist from project config and start the guard proxy
+    derive_docker_allowlist
+    start_docker_guard
   fi
 }
