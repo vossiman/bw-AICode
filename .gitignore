@@ -1,2 +1,2 @@
 *.exe
-bw-docker-guard
+/bw-docker-guard
