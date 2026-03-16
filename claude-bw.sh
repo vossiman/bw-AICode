@@ -35,33 +35,48 @@ OVERLAY_BINDS=(
 )
 
 if [[ "$BW_FULL_DOCKER" == true ]]; then
+  # --full-docker: mount raw Docker socket (unrestricted access)
   OVERLAY_BINDS+=("rw /run/docker.sock")
+elif [[ -n "${BW_GUARD_SOCKET:-}" ]]; then
+  # Guarded/read-only: bind-mount the guard proxy socket into the sandbox
+  OVERLAY_BINDS+=("ro $BW_GUARD_SOCKET /run/bw-docker-guard.sock")
 fi
 
 build_bwrap_args BINDS BWRAP_ARGS
 build_bwrap_args OVERLAY_BINDS BWRAP_OVERLAY_ARGS
 
-exec bwrap \
-  "${BWRAP_ARGS[@]}" \
-  --proc /proc \
-  --dev /dev \
-  --tmpfs /tmp \
-  --tmpfs /run \
-  "${BWRAP_OVERLAY_ARGS[@]}" \
-  --symlink /run /var/run \
-  --setenv HOME "$HOME" \
-  --setenv PATH "${BW_VENV_PATH:+$BW_VENV_PATH/bin:}$HOME/.local/bin:$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin" \
-  --setenv SHELL /bin/bash \
-  ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"} \
-  ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"} \
-  ${BW_VENV_PATH:+--setenv VIRTUAL_ENV "$BW_VENV_PATH"} \
-  --setenv CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS 1 \
-  --setenv CLAUDE_CODE_DISABLE_AUTO_MEMORY 0 \
-  --setenv TMUX_TMPDIR "/tmp/tmux-claude-$(id -u)" \
-  --setenv CLAUDE_CODE_SPAWN_BACKEND "tmux" \
-  --setenv DOCKER_HOST "$BW_DOCKER_HOST" \
-  --chdir "$STARTDIR" \
-  --unshare-ipc \
-  --unshare-pid \
-  --die-with-parent \
+BWRAP_CMD=(
+  bwrap
+  "${BWRAP_ARGS[@]}"
+  --proc /proc
+  --dev /dev
+  --tmpfs /tmp
+  --tmpfs /run
+  "${BWRAP_OVERLAY_ARGS[@]}"
+  --symlink /run /var/run
+  --setenv HOME "$HOME"
+  --setenv PATH "${BW_VENV_PATH:+$BW_VENV_PATH/bin:}$HOME/.local/bin:$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin"
+  --setenv SHELL /bin/bash
+  ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"}
+  ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"}
+  ${BW_VENV_PATH:+--setenv VIRTUAL_ENV "$BW_VENV_PATH"}
+  --setenv CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS 1
+  --setenv CLAUDE_CODE_DISABLE_AUTO_MEMORY 0
+  --setenv TMUX_TMPDIR "/tmp/tmux-claude-$(id -u)"
+  --setenv CLAUDE_CODE_SPAWN_BACKEND "tmux"
+  --setenv DOCKER_HOST "$BW_DOCKER_HOST"
+  --chdir "$STARTDIR"
+  --unshare-ipc
+  --unshare-pid
+  --die-with-parent
   claude --dangerously-skip-permissions "${BW_TOOL_ARGS[@]}"
+)
+
+if [[ -n "${BW_GUARD_PID:-}" ]]; then
+  # Guard proxy is running — use foreground bwrap so cleanup trap fires on exit
+  trap cleanup_docker_guard EXIT
+  "${BWRAP_CMD[@]}"
+else
+  # --full-docker or guard not needed — exec replaces this process
+  exec "${BWRAP_CMD[@]}"
+fi
