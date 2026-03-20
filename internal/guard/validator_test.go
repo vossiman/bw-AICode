@@ -472,15 +472,23 @@ func TestValidateImagePull(t *testing.T) {
 	})
 }
 
-// T3: Build endpoint unconditionally denied
+// T3: Build endpoint — all builds allowed in guarded mode, denied in read-only
 func TestValidateBuild(t *testing.T) {
 	v, _ := newTestValidator()
 
-	t.Run("build allowed in guarded mode", func(t *testing.T) {
+	t.Run("build with tag allowed in guarded mode", func(t *testing.T) {
 		r := makeRequest("POST", "/v1.45/build?t=myimage:latest", "")
 		d := v.Validate(r)
 		if !d.Allow {
 			t.Errorf("build should be allowed in guarded mode, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("build without tag allowed in guarded mode", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/build", "")
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("build without tag should be allowed in guarded mode, got deny: %s", d.Reason)
 		}
 	})
 
@@ -489,6 +497,14 @@ func TestValidateBuild(t *testing.T) {
 		d := v.Validate(r)
 		if !d.Allow {
 			t.Errorf("unversioned build should be allowed in guarded mode, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("build with non-allowlisted tag allowed", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/build?t=custom:dev", "")
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("build with any tag should be allowed in guarded mode, got deny: %s", d.Reason)
 		}
 	})
 

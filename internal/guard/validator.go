@@ -333,13 +333,14 @@ func (v *Validator) validateExecStart(path string) Decision {
 }
 
 func (v *Validator) validateBuild(r *http.Request) Decision {
-	// Builds are allowed in guarded mode (images are in the allowlist).
-	// Building an image is safe — the danger is in running containers with
-	// bad mounts/privileges, which is validated separately at container create.
-	// In read-only mode, builds are blocked.
 	if v.config.IsReadOnly() {
 		return deny("build is not allowed in read-only mode")
 	}
+
+	// Allow all builds in guarded mode. The real security boundary is
+	// container-create-time validation (image allowlist, volume checks, etc.).
+	// Build-only images may have names that don't match the allowlist exactly
+	// (e.g. docker compose uses <project>-<service> naming).
 	return allow("build allowed")
 }
 
