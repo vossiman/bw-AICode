@@ -22,7 +22,16 @@ func main() {
 	configPath := flag.String("config", "", "Path to allowlist JSON config")
 	socketPath := flag.String("socket", "", "Path to Unix socket to listen on")
 	dockerSocket := flag.String("docker-socket", "/var/run/docker.sock", "Path to real Docker socket")
+	logPath := flag.String("log", "", "Path to log file (default: stderr)")
 	flag.Parse()
+
+	if *logPath != "" {
+		f, err := os.OpenFile(*logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("[bw-docker-guard] failed to open log file: %v", err)
+		}
+		log.SetOutput(f)
+	}
 
 	if *configPath == "" || *socketPath == "" {
 		fmt.Fprintln(os.Stderr, "Usage: bw-docker-guard --config <path> --socket <path>")

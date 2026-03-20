@@ -135,14 +135,14 @@ derive_docker_allowlist() {
       compose_images="$(echo "$resolved" | jq -r '.services // {} | to_entries[] | .value.image // empty' 2>/dev/null)"
       while IFS= read -r img; do
         [[ -n "$img" ]] && images+=("$img")
-      done <<< "$compose_images"
+      done <<< "$compose_images" || true
 
       # Extract network names
       local compose_networks
       compose_networks="$(echo "$resolved" | jq -r '.networks // {} | keys[]' 2>/dev/null)"
       while IFS= read -r net; do
         [[ -n "$net" ]] && networks+=("${compose_project}_${net}")
-      done <<< "$compose_networks"
+      done <<< "$compose_networks" || true
     else
       echo "Warning: docker compose config failed for $compose_file; allowlist may be incomplete" >&2
     fi
@@ -188,12 +188,45 @@ derive_docker_allowlist() {
     ' "$file" 2>/dev/null)"
     while IFS= read -r img; do
       [[ -n "$img" ]] && images+=("$img")
-    done <<< "$mcp_images"
+    done <<< "$mcp_images" || true
+
+    # Also extract images from shell-wrapped docker commands
+    # (e.g. "command": "sh", "args": ["-c", "... docker run ... image ..."])
+    local shell_mcp_images
+    shell_mcp_images="$(jq -r '
+      (.mcpServers // {}) | to_entries[] |
+      select((.value.command // "") | test("^(sh|bash|/bin/sh|/bin/bash)$")) |
+      .value.args // [] |
+      (index("-c")) as $idx |
+      if $idx then .[$idx + 1] // empty else empty end |
+      capture("docker\\s+run\\s+(?<rest>.*)") | .rest |
+      [split(" ")[] | select(. != "")] |
+      reduce .[] as $arg (
+        {state: "scanning", image: null};
+        if .image != null then .
+        elif .state == "skip_next" then .state = "scanning"
+        elif ($arg | test("^--?[a-zA-Z]")) then
+          if ($arg | test("^--(network|name|env|volume|workdir|user|entrypoint|label|mount|publish|expose|hostname|domainname|memory|cpus|platform|pull|runtime|security-opt|ulimit|log-driver|log-opt|pid|uts|ipc|cgroupns|restart|stop-signal|stop-timeout|memory-swap|cpu-shares|shm-size|pids-limit|tmpfs|add-host|dns|mac-address|cap-add|cap-drop|device|cidfile)=")) then .
+          elif ($arg | test("^-[evpwumlh]$")) then {state: "skip_next", image: null}
+          elif ($arg | test("^--(network|name|env|volume|workdir|user|entrypoint|label|mount|publish|expose|hostname|domainname|memory|cpus|platform|pull|runtime|security-opt|ulimit|log-driver|log-opt|pid|uts|ipc|cgroupns|restart|stop-signal|stop-timeout|memory-swap|cpu-shares|shm-size|pids-limit|tmpfs|add-host|dns|mac-address|cap-add|cap-drop|device|cidfile)$")) then {state: "skip_next", image: null}
+          else .
+          end
+        elif ($arg | test("^-")) then .
+        else {state: "done", image: $arg}
+        end
+      ) | .image // empty
+    ' "$file" 2>/dev/null)"
+    while IFS= read -r img; do
+      [[ -n "$img" ]] && images+=("$img")
+    done <<< "$shell_mcp_images" || true
   }
 
   # Check per-project MCP configs
   _extract_mcp_docker_images "$STARTDIR/.mcp.json"
   _extract_mcp_docker_images "$STARTDIR/.claude/settings.local.json"
+
+  # Check global Claude Code config
+  _extract_mcp_docker_images "$HOME/.claude.json"
 
   # Check global Claude desktop config
   _extract_mcp_docker_images "$HOME/.config/Claude/claude_desktop_config.json"
@@ -250,10 +283,18 @@ derive_docker_allowlist() {
 # --- Docker guard lifecycle ---
 # Start bw-docker-guard proxy. Sets BW_GUARD_PID, BW_GUARD_SOCKET, BW_DOCKER_HOST.
 start_docker_guard() {
+  if ! command -v bw-docker-guard &>/dev/null; then
+    echo "Error: bw-docker-guard not found in PATH" >&2
+    echo "Run: cd $(dirname "$(readlink -f "${BASH_SOURCE[0]}")") && go build -o ~/.local/bin/bw-docker-guard ./cmd/bw-docker-guard" >&2
+    exit 1
+  fi
+
   BW_GUARD_SOCKET="/tmp/bw-docker-guard-$$.sock"
+  BW_GUARD_LOG="/tmp/bw-docker-guard-$$.log"
   bw-docker-guard \
     --config "$BW_DOCKER_GUARD_CONFIG" \
-    --socket "$BW_GUARD_SOCKET" &
+    --socket "$BW_GUARD_SOCKET" \
+    --log "$BW_GUARD_LOG" &
   BW_GUARD_PID=$!
 
   # Wait for socket to appear (up to 1 second)
@@ -265,6 +306,7 @@ start_docker_guard() {
 
   if [[ ! -S "$BW_GUARD_SOCKET" ]]; then
     echo "Error: bw-docker-guard failed to start" >&2
+    [[ -s "$BW_GUARD_LOG" ]] && tail -5 "$BW_GUARD_LOG" >&2
     kill "$BW_GUARD_PID" 2>/dev/null
     exit 1
   fi
@@ -272,6 +314,7 @@ start_docker_guard() {
   # Verify the guard process is still alive after socket appeared
   if ! kill -0 "$BW_GUARD_PID" 2>/dev/null; then
     echo "Error: bw-docker-guard exited unexpectedly" >&2
+    [[ -s "$BW_GUARD_LOG" ]] && tail -5 "$BW_GUARD_LOG" >&2
     rm -f "$BW_GUARD_SOCKET"
     exit 1
   fi
@@ -283,6 +326,7 @@ start_docker_guard() {
 cleanup_docker_guard() {
   [[ -n "${BW_GUARD_PID:-}" ]] && kill "$BW_GUARD_PID" 2>/dev/null
   [[ -n "${BW_GUARD_SOCKET:-}" ]] && rm -f "$BW_GUARD_SOCKET"
+  [[ -n "${BW_GUARD_LOG:-}" ]] && rm -f "$BW_GUARD_LOG"
   [[ -n "${BW_DOCKER_GUARD_CONFIG:-}" ]] && rm -f "$BW_DOCKER_GUARD_CONFIG"
 }
 
@@ -325,9 +369,43 @@ parse_bw_flags() {
     if [[ -d "$wsl_cli_tools" ]]; then
       COMMON_BINDS+=("ro $wsl_cli_tools")
     fi
+
+    echo "[bw] Docker: full (unrestricted socket access)" >&2
   else
     # Derive allowlist from project config and start the guard proxy
     derive_docker_allowlist
     start_docker_guard
+    _print_guard_summary
+  fi
+}
+
+# Print a startup summary of the Docker guard configuration.
+_print_guard_summary() {
+  local cfg="$BW_DOCKER_GUARD_CONFIG"
+  local mode="$BW_DOCKER_MODE"
+  local images networks
+
+  if [[ "$mode" == "readonly" ]]; then
+    echo "[bw] Docker: read-only (no images allowed)" >&2
+    echo "[bw]   log: $BW_GUARD_LOG" >&2
+    return
+  fi
+
+  images="$(jq -r '.allowed_images[]' "$cfg" 2>/dev/null)"
+  networks="$(jq -r '.allowed_networks[]' "$cfg" 2>/dev/null)"
+
+  echo "[bw] Docker: guarded" >&2
+  echo "[bw]   log: $BW_GUARD_LOG" >&2
+  if [[ -n "$images" ]]; then
+    echo "[bw]   images:" >&2
+    while IFS= read -r img; do
+      echo "[bw]     + $img" >&2
+    done <<< "$images"
+  fi
+  if [[ -n "$networks" ]]; then
+    echo "[bw]   networks:" >&2
+    while IFS= read -r net; do
+      echo "[bw]     + $net" >&2
+    done <<< "$networks"
   fi
 }
