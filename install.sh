@@ -126,5 +126,5 @@ else
 fi
 
 echo ""
-echo -e "  ${GREEN}${BOLD}Done.${RESET} Run ${CYAN}claude-bw${RESET} or ${CYAN}opencode-bw${RESET} from inside ${BOLD}~/local_dev${RESET}"
+echo -e "  ${GREEN}${BOLD}Done.${RESET} Run ${CYAN}claude-bw${RESET} or ${CYAN}opencode-bw${RESET} from your project directory"
 echo ""

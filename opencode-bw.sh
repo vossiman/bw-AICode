@@ -1,7 +1,6 @@
 #!/bin/bash
 # opencode-bw — Run OpenCode sandboxed via bubblewrap
-# Must be run from within ~/local_dev or a subdirectory.
-# Writable: ~/local_dev only. Everything else is read-only or invisible.
+# Writable: current directory only. Everything else is read-only or invisible.
 # Runs with OPENCODE_PERMISSION=allow (safe because bwrap enforces the sandbox).
 
 set -euo pipefail

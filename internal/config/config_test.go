@@ -10,11 +10,11 @@ func TestLoadConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	err := os.WriteFile(path, []byte(`{
-		"project_dir": "/home/user/local_dev/myproject",
+		"project_dir": "/home/user/myproject",
 		"compose_project": "myproject",
 		"allowed_images": ["postgres:16", "mcp/postgres"],
 		"allowed_networks": ["myproject_default"],
-		"volume_mount_root": "/home/user/local_dev/myproject"
+		"volume_mount_root": "/home/user/myproject"
 	}`), 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -24,8 +24,8 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(%q) error: %v", path, err)
 	}
-	if cfg.ProjectDir != "/home/user/local_dev/myproject" {
-		t.Errorf("ProjectDir = %q, want /home/user/local_dev/myproject", cfg.ProjectDir)
+	if cfg.ProjectDir != "/home/user/myproject" {
+		t.Errorf("ProjectDir = %q, want /home/user/myproject", cfg.ProjectDir)
 	}
 	if len(cfg.AllowedImages) != 2 {
 		t.Errorf("AllowedImages len = %d, want 2", len(cfg.AllowedImages))
@@ -36,10 +36,10 @@ func TestLoadConfigEmpty(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	err := os.WriteFile(path, []byte(`{
-		"project_dir": "/home/user/local_dev/myproject",
+		"project_dir": "/home/user/myproject",
 		"allowed_images": [],
 		"allowed_networks": [],
-		"volume_mount_root": "/home/user/local_dev/myproject"
+		"volume_mount_root": "/home/user/myproject"
 	}`), 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +58,7 @@ func TestLoadConfigDefaultsVolumeMountRoot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	err := os.WriteFile(path, []byte(`{
-		"project_dir": "/home/user/local_dev/myproject"
+		"project_dir": "/home/user/myproject"
 	}`), 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +68,7 @@ func TestLoadConfigDefaultsVolumeMountRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if cfg.VolumeMountRoot != "/home/user/local_dev/myproject" {
+	if cfg.VolumeMountRoot != "/home/user/myproject" {
 		t.Errorf("VolumeMountRoot = %q, want project_dir value", cfg.VolumeMountRoot)
 	}
 }
@@ -196,6 +196,34 @@ func TestIsVolumePathAllowedSocketPaths(t *testing.T) {
 		if cfg.IsVolumePathAllowed(sp) {
 			t.Errorf("socket path %q should be denied", sp)
 		}
+	}
+}
+
+// Test AllowedVolumePaths — explicitly allowed paths override socket checks
+func TestAllowedVolumePaths(t *testing.T) {
+	cfg := &Config{
+		VolumeMountRoot:    "/project",
+		AllowedVolumePaths: []string{"/var/run/docker.sock"},
+	}
+
+	// docker.sock allowed because it's in AllowedVolumePaths
+	if !cfg.IsVolumePathAllowed("/var/run/docker.sock") {
+		t.Error("/var/run/docker.sock should be allowed when in AllowedVolumePaths")
+	}
+
+	// Other socket paths still denied
+	if cfg.IsVolumePathAllowed("/var/run/podman.sock") {
+		t.Error("/var/run/podman.sock should be denied (not in AllowedVolumePaths)")
+	}
+
+	// Paths outside project and not in AllowedVolumePaths still denied
+	if cfg.IsVolumePathAllowed("/etc/passwd") {
+		t.Error("/etc/passwd should be denied")
+	}
+
+	// Paths under project still work
+	if !cfg.IsVolumePathAllowed("/project/data") {
+		t.Error("/project/data should be allowed (under VolumeMountRoot)")
 	}
 }
 

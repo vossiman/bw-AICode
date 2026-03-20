@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repo contains two bubblewrap (`bwrap`) sandbox wrapper scripts that run AI coding tools (Claude Code, OpenCode) with restricted filesystem access. The scripts enforce that only `~/local_dev` is writable; everything else is read-only or invisible.
+This repo contains two bubblewrap (`bwrap`) sandbox wrapper scripts that run AI coding tools (Claude Code, OpenCode) with restricted filesystem access. The scripts enforce that only the current directory (where you launch the wrapper) is writable; everything else is read-only or invisible.
 
 ## Files
 
@@ -16,9 +16,8 @@ This repo contains two bubblewrap (`bwrap`) sandbox wrapper scripts that run AI 
 ## Sandbox Security Model
 
 Both scripts share the same pattern:
-1. Enforce `pwd` is within `~/local_dev`
-2. Mount system dirs (`/usr`, `/lib`, `/bin`, `/etc`) **read-only**
-3. Mount `~/local_dev` as the **only writable project area**
+1. Mount system dirs (`/usr`, `/lib`, `/bin`, `/etc`) **read-only**
+2. Mount the current directory as the **only writable project area**
 4. Mount tool-specific config/state dirs read-write (e.g., `~/.claude`, `~/.config/opencode`)
 5. Isolate IPC/PID namespaces but **not** user namespace (preserves docker group membership)
 6. Docker API via `bw-docker-guard` proxy — auto-derives allowlist from project config (compose files, MCP configs). Raw socket only mounted with `--full-docker`.

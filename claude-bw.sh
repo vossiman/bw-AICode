@@ -1,7 +1,6 @@
 #!/bin/bash
 # claude-bw — Run Claude Code sandboxed via bubblewrap
-# Must be run from within ~/local_dev or a subdirectory.
-# Writable: ~/local_dev only. Everything else is read-only or invisible.
+# Writable: current directory only. Everything else is read-only or invisible.
 # Runs with --dangerously-skip-permissions (safe because we're sandboxed).
 
 set -euo pipefail

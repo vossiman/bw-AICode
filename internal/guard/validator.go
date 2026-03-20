@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -177,6 +178,16 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	// Check bind mounts (HostConfig.Binds)
 	for _, bind := range req.HostConfig.Binds {
 		hostPath := strings.SplitN(bind, ":", 2)[0]
+		// Named volumes (e.g. "myapp_data:/data") are Docker-managed, not host
+		// filesystem paths. They don't contain "/" and don't start with "." or "~".
+		if !strings.HasPrefix(hostPath, "/") && !strings.HasPrefix(hostPath, ".") &&
+			!strings.HasPrefix(hostPath, "~") && !strings.Contains(hostPath, "/") {
+			continue
+		}
+		// Resolve relative paths against project directory
+		if !filepath.IsAbs(hostPath) {
+			hostPath = filepath.Join(v.config.ProjectDir, hostPath)
+		}
 		if !v.config.IsVolumePathAllowed(hostPath) {
 			return deny(fmt.Sprintf("volume mount path %q is not allowed", hostPath))
 		}

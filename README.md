@@ -1,11 +1,11 @@
 # bw-AICode
 
-Bubblewrap (`bwrap`) sandbox wrappers for AI coding tools. Runs Claude Code and OpenCode with restricted filesystem access — only `~/local_dev` is writable, everything else is read-only or invisible.
+Bubblewrap (`bwrap`) sandbox wrappers for AI coding tools. Runs Claude Code and OpenCode with restricted filesystem access — only the current directory is writable, everything else is read-only or invisible.
 
 ## Sandbox security model
 
 - System directories (`/usr`, `/lib`, `/bin`, `/etc`) mounted **read-only**
-- `~/local_dev` is the **only writable project area**
+- Current directory (pwd) is the **only writable project area**
 - Tool-specific config/state dirs mounted read-write as needed
 - IPC/PID namespaces isolated (user namespace preserved for docker group)
 - Docker API access via `bw-docker-guard` proxy (auto-detects allowed containers from project config)
@@ -24,8 +24,8 @@ Bubblewrap (`bwrap`) sandbox wrappers for AI coding tools. Runs Claude Code and 
 ## Install
 
 ```bash
-git clone <repo-url> ~/local_dev/bw-AICode
-cd ~/local_dev/bw-AICode
+git clone <repo-url> bw-AICode
+cd bw-AICode
 ./install.sh
 ```
 
@@ -41,12 +41,12 @@ Make sure `~/.local/bin` is in your `PATH`.
 ## Usage
 
 ```bash
-cd ~/local_dev/my-project
+cd my-project
 claude-bw          # start Claude Code sandboxed
 opencode-bw        # start OpenCode sandboxed
 ```
 
-Must be run from within `~/local_dev` or a subdirectory.
+Run from the project directory you want to work in. Only that directory (and its subdirectories) will be writable inside the sandbox.
 
 ### Docker access modes
 

@@ -148,6 +148,25 @@ func TestValidateContainerCreate(t *testing.T) {
 			body:  `{"Image": "postgres:16", "HostConfig": {"Binds": ["/project/data:/var/lib/data"]}}`,
 			allow: true,
 		},
+		// Named volume (not a path) — should be allowed
+		{
+			name:  "named volume (Docker-managed)",
+			body:  `{"Image": "postgres:16", "HostConfig": {"Binds": ["myapp_data:/var/lib/data"]}}`,
+			allow: true,
+		},
+		// Relative path under project dir — allowed
+		{
+			name:  "relative path under project dir",
+			body:  `{"Image": "postgres:16", "HostConfig": {"Binds": ["./data:/var/lib/data"]}}`,
+			allow: true,
+		},
+		// Relative path traversal outside project — denied
+		{
+			name:   "relative path traversal",
+			body:   `{"Image": "postgres:16", "HostConfig": {"Binds": ["../../etc/passwd:/etc/passwd"]}}`,
+			allow:  false,
+			reason: "volume",
+		},
 		// Test 4: Volume mount outside project dir
 		{
 			name:   "volume mount outside project dir",

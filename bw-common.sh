@@ -1,7 +1,6 @@
 # bw-common.sh — Shared bind definitions and builder for bwrap sandbox scripts
 # Sourced by claude-bw.sh and opencode-bw.sh. Not executable.
 
-WORKSPACE="$HOME/local_dev"
 STARTDIR="$(pwd)"
 
 # Auto-detect local virtualenv (.venv) in the current directory
@@ -9,17 +8,6 @@ BW_VENV_PATH=""
 if [[ -x "$STARTDIR/.venv/bin/python" ]]; then
   BW_VENV_PATH="$STARTDIR/.venv"
 fi
-
-# Verify we're inside ~/local_dev
-case "$STARTDIR" in
-  "$WORKSPACE"|"$WORKSPACE"/*)
-    ;;
-  *)
-    echo "Error: Must be run from within $WORKSPACE"
-    echo "Current directory: $STARTDIR"
-    exit 1
-    ;;
-esac
 
 # --- Shared bind definitions ---
 # Format: "mode source [dest]"
@@ -43,8 +31,8 @@ COMMON_BINDS=(
   # Linuxbrew
   "ro /home/linuxbrew"
 
-  # Workspace — the ONLY writable project area
-  "rw $WORKSPACE"
+  # Project directory (pwd at launch) — the ONLY writable project area
+  "rw $STARTDIR"
 
   # Git config + SSH keys (read-only — push needs key access)
   "ro $HOME/.gitconfig"
@@ -109,7 +97,7 @@ build_bwrap_args() {
 # server configs. Produces a JSON allowlist for bw-docker-guard.
 # Sets: BW_DOCKER_MODE ("guarded"|"readonly"), BW_DOCKER_GUARD_CONFIG (path)
 derive_docker_allowlist() {
-  local images=() networks=() compose_project=""
+  local images=() networks=() extra_volume_paths=() compose_project=""
 
   # --- Source 1: Docker Compose files ---
   local compose_file=""
@@ -121,8 +109,6 @@ derive_docker_allowlist() {
   done
 
   if [[ -n "$compose_file" ]]; then
-    compose_project="$(basename "$STARTDIR")"
-
     # Use docker compose config to resolve interpolation, extends, etc.
     local resolved
     if ! command -v docker &>/dev/null; then
@@ -130,25 +116,43 @@ derive_docker_allowlist() {
     elif ! docker compose version &>/dev/null; then
       echo "Warning: docker compose plugin not available; cannot resolve compose file" >&2
     elif resolved="$(docker compose -f "$compose_file" config --format json 2>/dev/null)"; then
-      # Extract service images
+      # Extract project name from resolved config (handles COMPOSE_PROJECT_NAME, name: directive, etc.)
+      compose_project="$(echo "$resolved" | jq -r '.name // empty' 2>/dev/null)"
+      [[ -z "$compose_project" ]] && compose_project="$(basename "$STARTDIR")"
+
+      # Extract service images (explicit image or default name for build-only services)
       local compose_images
-      compose_images="$(echo "$resolved" | jq -r '.services // {} | to_entries[] | .value.image // empty' 2>/dev/null)"
+      compose_images="$(echo "$resolved" | jq -r --arg proj "$compose_project" '
+        .services // {} | to_entries[] |
+        if .value.image then .value.image
+        elif .value.build then "\($proj)-\(.key)"
+        else empty end
+      ' 2>/dev/null)"
       while IFS= read -r img; do
         [[ -n "$img" ]] && images+=("$img")
       done <<< "$compose_images" || true
 
-      # Extract network names
+      # Extract resolved network names (uses .name field which includes project prefix)
       local compose_networks
-      compose_networks="$(echo "$resolved" | jq -r '.networks // {} | keys[]' 2>/dev/null)"
+      compose_networks="$(echo "$resolved" | jq -r '.networks // {} | to_entries[] | .value.name // .key' 2>/dev/null)"
       while IFS= read -r net; do
-        [[ -n "$net" ]] && networks+=("${compose_project}_${net}")
+        [[ -n "$net" ]] && networks+=("$net")
       done <<< "$compose_networks" || true
+
+      # Extract bind mount sources outside project dir (e.g. /var/run/docker.sock)
+      local compose_binds
+      compose_binds="$(echo "$resolved" | jq -r '
+        [.services // {} | to_entries[] | .value.volumes // [] | .[] |
+         select(type == "object" and .type == "bind") | .source] | unique[]
+      ' 2>/dev/null)"
+      while IFS= read -r bp; do
+        [[ -n "$bp" ]] || continue
+        case "$bp" in "$STARTDIR"|"$STARTDIR"/*) ;; *) extra_volume_paths+=("$bp") ;; esac
+      done <<< "$compose_binds" || true
     else
       echo "Warning: docker compose config failed for $compose_file; allowlist may be incomplete" >&2
+      compose_project="$(basename "$STARTDIR")"
     fi
-
-    # Always add the default compose network
-    networks+=("${compose_project}_default")
   fi
 
   # --- Source 2: MCP server configs (Docker-based entries) ---
@@ -257,12 +261,17 @@ derive_docker_allowlist() {
   # --- Write JSON config ---
   BW_DOCKER_GUARD_CONFIG="$(mktemp /tmp/bw-docker-guard-XXXXXX.json)"
 
-  local images_json networks_json
+  local images_json networks_json volume_paths_json
   images_json="$(printf '%s\n' "${unique_images[@]}" | jq -R . | jq -s .)"
   if (( ${#unique_networks[@]} > 0 )); then
     networks_json="$(printf '%s\n' "${unique_networks[@]}" | jq -R . | jq -s .)"
   else
     networks_json="[]"
+  fi
+  if (( ${#extra_volume_paths[@]} > 0 )); then
+    volume_paths_json="$(printf '%s\n' "${extra_volume_paths[@]}" | jq -R . | jq -s .)"
+  else
+    volume_paths_json="[]"
   fi
 
   jq -n \
@@ -271,12 +280,14 @@ derive_docker_allowlist() {
     --argjson images "$images_json" \
     --argjson networks "$networks_json" \
     --arg volume_mount_root "$STARTDIR" \
+    --argjson volume_paths "$volume_paths_json" \
     '{
       project_dir: $project_dir,
       compose_project: $compose_project,
       allowed_images: $images,
       allowed_networks: $networks,
-      volume_mount_root: $volume_mount_root
+      volume_mount_root: $volume_mount_root,
+      allowed_volume_paths: $volume_paths
     }' > "$BW_DOCKER_GUARD_CONFIG"
 }
 

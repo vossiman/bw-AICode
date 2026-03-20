@@ -55,7 +55,7 @@ opencode-bw --full-docker
 
 This bind-mounts the real Docker socket (`/run/docker.sock`) read-write into the sandbox and sets `DOCKER_HOST=unix:///var/run/docker.sock`. All Docker operations work, including `docker run` with arbitrary volume mounts.
 
-**Security tradeoff:** The AI tool can escape the bwrap sandbox via Docker. The filesystem restrictions enforced by bwrap (only `~/local_dev` writable, system dirs read-only) can be bypassed by creating a container that mounts host paths.
+**Security tradeoff:** The AI tool can escape the bwrap sandbox via Docker. The filesystem restrictions enforced by bwrap (only the current directory writable, system dirs read-only) can be bypassed by creating a container that mounts host paths.
 
 ## Why the proxy can't safely allow `docker run`
 

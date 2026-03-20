@@ -26,11 +26,12 @@ var knownSocketPaths = map[string]bool{
 }
 
 type Config struct {
-	ProjectDir      string   `json:"project_dir"`
-	ComposeProject  string   `json:"compose_project"`
-	AllowedImages   []string `json:"allowed_images"`
-	AllowedNetworks []string `json:"allowed_networks"`
-	VolumeMountRoot string   `json:"volume_mount_root"`
+	ProjectDir         string   `json:"project_dir"`
+	ComposeProject     string   `json:"compose_project"`
+	AllowedImages      []string `json:"allowed_images"`
+	AllowedNetworks    []string `json:"allowed_networks"`
+	VolumeMountRoot    string   `json:"volume_mount_root"`
+	AllowedVolumePaths []string `json:"allowed_volume_paths"`
 }
 
 // IsReadOnly returns true if no images are allowed (read-only mode).
@@ -66,24 +67,17 @@ func isSocketPath(cleanPath string) bool {
 	return socketBasenames[filepath.Base(cleanPath)]
 }
 
-// IsVolumePathAllowed checks if the host path is under the volume mount root.
+// IsVolumePathAllowed checks if the host path is under the volume mount root
+// or matches an explicitly allowed volume path.
 // It resolves symlinks and cleans paths before comparison.
 func (c *Config) IsVolumePathAllowed(hostPath string) bool {
-	if c.VolumeMountRoot == "" {
+	if c.VolumeMountRoot == "" && len(c.AllowedVolumePaths) == 0 {
 		return false
 	}
 
 	cleanPath := filepath.Clean(hostPath)
 
-	// Block known socket paths before symlink resolution
-	if isSocketPath(cleanPath) {
-		return false
-	}
-
-	// Resolve symlinks to prevent traversal attacks.
-	// If the full path doesn't exist, resolve the longest existing ancestor
-	// to catch symlinks that point outside the root (e.g., /project/symlink/child
-	// where symlink -> /outside).
+	// Resolve symlinks for comparison
 	resolved, err := filepath.EvalSymlinks(cleanPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -93,8 +87,20 @@ func (c *Config) IsVolumePathAllowed(hostPath string) bool {
 		}
 	}
 
-	// Also check the resolved path for socket basenames
-	if isSocketPath(resolved) {
+	// Check explicitly allowed volume paths first (these override socket checks).
+	// Compare against both clean and resolved paths to handle symlinks like /var/run -> /run.
+	for _, allowed := range c.AllowedVolumePaths {
+		if cleanPath == allowed || resolved == allowed {
+			return true
+		}
+	}
+
+	// Block known socket paths (only if not explicitly allowed above)
+	if isSocketPath(cleanPath) || isSocketPath(resolved) {
+		return false
+	}
+
+	if c.VolumeMountRoot == "" {
 		return false
 	}
 
@@ -146,6 +152,13 @@ func Load(path string) (*Config, error) {
 	resolved, err := filepath.EvalSymlinks(cfg.VolumeMountRoot)
 	if err == nil {
 		cfg.VolumeMountRoot = resolved
+	}
+
+	// Resolve AllowedVolumePaths symlinks
+	for i, p := range cfg.AllowedVolumePaths {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			cfg.AllowedVolumePaths[i] = r
+		}
 	}
 
 	return &cfg, nil
