@@ -30,9 +30,6 @@ func TestLoadConfig(t *testing.T) {
 	if len(cfg.AllowedImages) != 2 {
 		t.Errorf("AllowedImages len = %d, want 2", len(cfg.AllowedImages))
 	}
-	if cfg.VolumeMountRoot != "/home/user/local_dev/myproject" {
-		t.Errorf("VolumeMountRoot = %q, want /home/user/local_dev/myproject", cfg.VolumeMountRoot)
-	}
 }
 
 func TestLoadConfigEmpty(t *testing.T) {
@@ -119,21 +116,23 @@ func TestIsNetworkAllowed(t *testing.T) {
 }
 
 func TestIsVolumePathAllowed(t *testing.T) {
-	cfg := &Config{VolumeMountRoot: "/home/user/local_dev/myproject"}
+	// Use a real temp dir so symlink resolution works
+	root := t.TempDir()
+	subdir := filepath.Join(root, "src")
+	os.MkdirAll(subdir, 0755)
+
+	cfg := &Config{VolumeMountRoot: root}
 
 	tests := []struct {
 		path    string
 		allowed bool
 	}{
-		{"/home/user/local_dev/myproject", true},
-		{"/home/user/local_dev/myproject/src", true},
-		{"/home/user/local_dev/myproject/data/db", true},
-		{"/home/user/local_dev/otherproject", false},
-		{"/home/user/local_dev/myproject-evil", false},
-		{"/", false},
+		{root, true},
+		{filepath.Join(root, "src"), true},
+		{filepath.Join(root, "data", "db"), true}, // non-existent subdir, still allowed
 		{"/etc/passwd", false},
-		{"/var/run/docker.sock", false},
 		{"/home/user/.ssh", false},
+		{root + "-evil", false},
 	}
 
 	for _, tt := range tests {
@@ -141,5 +140,85 @@ func TestIsVolumePathAllowed(t *testing.T) {
 		if got != tt.allowed {
 			t.Errorf("IsVolumePathAllowed(%q) = %v, want %v", tt.path, got, tt.allowed)
 		}
+	}
+}
+
+// T1: Symlink traversal — symlink outside project denied, real subdirs allowed
+func TestIsVolumePathAllowedSymlinkTraversal(t *testing.T) {
+	// Create a project dir and an "outside" dir
+	projectDir := t.TempDir()
+	outsideDir := t.TempDir()
+
+	// Create a real subdir inside project
+	realSub := filepath.Join(projectDir, "data")
+	os.MkdirAll(realSub, 0755)
+
+	// Create a symlink inside project that points outside
+	symlinkPath := filepath.Join(projectDir, "escape")
+	os.Symlink(outsideDir, symlinkPath)
+
+	cfg := &Config{VolumeMountRoot: projectDir}
+
+	// Real subdir should be allowed
+	if !cfg.IsVolumePathAllowed(realSub) {
+		t.Errorf("real subdir %q should be allowed", realSub)
+	}
+
+	// Symlink pointing outside should be denied
+	if cfg.IsVolumePathAllowed(symlinkPath) {
+		t.Errorf("symlink to outside %q should be denied", symlinkPath)
+	}
+
+	// Path through symlink should also be denied
+	throughSymlink := filepath.Join(symlinkPath, "secret")
+	if cfg.IsVolumePathAllowed(throughSymlink) {
+		t.Errorf("path through symlink %q should be denied", throughSymlink)
+	}
+}
+
+// T1: Socket paths denied
+func TestIsVolumePathAllowedSocketPaths(t *testing.T) {
+	projectDir := t.TempDir()
+	cfg := &Config{VolumeMountRoot: projectDir}
+
+	socketPaths := []string{
+		"/var/run/docker.sock",
+		"/run/docker.sock",
+		"/var/run/podman.sock",
+		"/run/podman.sock",
+		"/some/path/docker.sock",
+		"/some/path/docker.socket",
+		"/some/path/podman.sock",
+		"/some/path/podman.socket",
+	}
+
+	for _, sp := range socketPaths {
+		if cfg.IsVolumePathAllowed(sp) {
+			t.Errorf("socket path %q should be denied", sp)
+		}
+	}
+}
+
+// Test that VolumeMountRoot symlinks are resolved in Load()
+func TestLoadResolvesVolumeMountRoot(t *testing.T) {
+	realDir := t.TempDir()
+	parentDir := t.TempDir()
+	symlinkPath := filepath.Join(parentDir, "link")
+	os.Symlink(realDir, symlinkPath)
+
+	configPath := filepath.Join(parentDir, "config.json")
+	os.WriteFile(configPath, []byte(`{
+		"project_dir": "`+realDir+`",
+		"volume_mount_root": "`+symlinkPath+`"
+	}`), 0644)
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+
+	// VolumeMountRoot should have been resolved to the real path
+	if cfg.VolumeMountRoot != realDir {
+		t.Errorf("VolumeMountRoot = %q, want %q (resolved symlink)", cfg.VolumeMountRoot, realDir)
 	}
 }

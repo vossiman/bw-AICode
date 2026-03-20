@@ -2,11 +2,28 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// Known Docker/Podman socket basenames that must never be volume-mounted.
+var socketBasenames = map[string]bool{
+	"docker.sock":    true,
+	"docker.socket":  true,
+	"podman.sock":    true,
+	"podman.socket":  true,
+}
+
+// Known absolute paths to Docker/Podman sockets.
+var knownSocketPaths = map[string]bool{
+	"/var/run/docker.sock":  true,
+	"/run/docker.sock":      true,
+	"/var/run/podman.sock":  true,
+	"/run/podman.sock":      true,
+}
 
 type Config struct {
 	ProjectDir      string   `json:"project_dir"`
@@ -41,26 +58,72 @@ func (c *Config) IsNetworkAllowed(name string) bool {
 	return false
 }
 
+// isSocketPath returns true if the path refers to a known Docker/Podman socket.
+func isSocketPath(cleanPath string) bool {
+	if knownSocketPaths[cleanPath] {
+		return true
+	}
+	return socketBasenames[filepath.Base(cleanPath)]
+}
+
 // IsVolumePathAllowed checks if the host path is under the volume mount root.
 // It resolves symlinks and cleans paths before comparison.
 func (c *Config) IsVolumePathAllowed(hostPath string) bool {
 	if c.VolumeMountRoot == "" {
 		return false
 	}
-	// Clean and resolve paths
-	cleanPath := filepath.Clean(hostPath)
-	cleanRoot := filepath.Clean(c.VolumeMountRoot)
 
-	// Block docker socket mounts explicitly
-	if strings.Contains(cleanPath, "docker.sock") {
+	cleanPath := filepath.Clean(hostPath)
+
+	// Block known socket paths before symlink resolution
+	if isSocketPath(cleanPath) {
 		return false
 	}
 
-	if cleanPath == cleanRoot {
+	// Resolve symlinks to prevent traversal attacks.
+	// If the full path doesn't exist, resolve the longest existing ancestor
+	// to catch symlinks that point outside the root (e.g., /project/symlink/child
+	// where symlink -> /outside).
+	resolved, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			resolved = resolveExistingAncestor(cleanPath)
+		} else {
+			return false
+		}
+	}
+
+	// Also check the resolved path for socket basenames
+	if isSocketPath(resolved) {
+		return false
+	}
+
+	root := c.VolumeMountRoot
+	if resolved == root {
 		return true
 	}
-	// Check prefix with trailing separator
-	return strings.HasPrefix(cleanPath, cleanRoot+"/")
+	return strings.HasPrefix(resolved, root+"/")
+}
+
+// resolveExistingAncestor walks up from path until it finds an existing
+// ancestor, resolves that ancestor's symlinks, then re-appends the remaining
+// tail. This catches cases like /project/symlink/child where symlink exists
+// and points outside the project, but child doesn't exist under the target.
+func resolveExistingAncestor(path string) string {
+	parent := filepath.Dir(path)
+	if parent == path {
+		// Reached root — return as-is
+		return path
+	}
+	resolved, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			resolved = resolveExistingAncestor(parent)
+		} else {
+			return path
+		}
+	}
+	return filepath.Join(resolved, filepath.Base(path))
 }
 
 func Load(path string) (*Config, error) {
@@ -78,5 +141,12 @@ func Load(path string) (*Config, error) {
 	if cfg.VolumeMountRoot == "" {
 		cfg.VolumeMountRoot = cfg.ProjectDir
 	}
+
+	// Resolve VolumeMountRoot symlinks once so comparisons are consistent
+	resolved, err := filepath.EvalSymlinks(cfg.VolumeMountRoot)
+	if err == nil {
+		cfg.VolumeMountRoot = resolved
+	}
+
 	return &cfg, nil
 }

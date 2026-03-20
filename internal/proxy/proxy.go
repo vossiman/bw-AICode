@@ -11,18 +11,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"regexp"
-	"strings"
 
 	"github.com/vossi/bw-docker-guard/internal/config"
 	"github.com/vossi/bw-docker-guard/internal/guard"
 	"github.com/vossi/bw-docker-guard/internal/ownership"
-)
-
-// URL patterns for intercepting responses.
-var (
-	reContainerCreate = regexp.MustCompile(`^(/v[\d.]+)?/containers/create$`)
-	reContainerExec   = regexp.MustCompile(`^(/v[\d.]+)?/containers/([^/]+)/exec$`)
 )
 
 // createResponse is the subset of Docker's container/exec create response we parse.
@@ -67,7 +59,7 @@ func NewHandler(cfg *config.Config, tracker *ownership.Tracker, dockerSocketPath
 		}
 
 		switch {
-		case reContainerCreate.MatchString(path):
+		case guard.ReContainerCreate.MatchString(path):
 			id, err := extractID(resp)
 			if err != nil {
 				log.Printf("[bw-docker-guard] WARNING: failed to extract container ID from response: %v", err)
@@ -77,7 +69,7 @@ func NewHandler(cfg *config.Config, tracker *ownership.Tracker, dockerSocketPath
 				tracker.Add(id)
 			}
 
-		case reContainerExec.MatchString(path):
+		case guard.ReContainerExec.MatchString(path):
 			id, err := extractID(resp)
 			if err != nil {
 				log.Printf("[bw-docker-guard] WARNING: failed to extract exec ID from response: %v", err)
@@ -141,9 +133,4 @@ func extractID(resp *http.Response) (string, error) {
 	}
 
 	return cr.ID, nil
-}
-
-// isWriteMethod returns true for HTTP methods that modify state.
-func isWriteMethod(method string) bool {
-	return !strings.EqualFold(method, http.MethodGet) && !strings.EqualFold(method, http.MethodHead)
 }

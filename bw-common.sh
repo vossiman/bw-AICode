@@ -125,7 +125,11 @@ derive_docker_allowlist() {
 
     # Use docker compose config to resolve interpolation, extends, etc.
     local resolved
-    if resolved="$(docker compose -f "$compose_file" config --format json 2>/dev/null)"; then
+    if ! command -v docker &>/dev/null; then
+      echo "Warning: docker not found; cannot resolve compose file" >&2
+    elif ! docker compose version &>/dev/null; then
+      echo "Warning: docker compose plugin not available; cannot resolve compose file" >&2
+    elif resolved="$(docker compose -f "$compose_file" config --format json 2>/dev/null)"; then
       # Extract service images
       local compose_images
       compose_images="$(echo "$resolved" | jq -r '.services // {} | to_entries[] | .value.image // empty' 2>/dev/null)"
@@ -139,11 +143,20 @@ derive_docker_allowlist() {
       while IFS= read -r net; do
         [[ -n "$net" ]] && networks+=("${compose_project}_${net}")
       done <<< "$compose_networks"
+    else
+      echo "Warning: docker compose config failed for $compose_file; allowlist may be incomplete" >&2
     fi
+
+    # Always add the default compose network
+    networks+=("${compose_project}_default")
   fi
 
   # --- Source 2: MCP server configs (Docker-based entries) ---
   # Extracts image names from MCP entries with "command": "docker"
+  #
+  # Best-effort: this parser handles common docker run flag patterns but cannot
+  # cover every possible flag combination. Unknown flags with values may cause
+  # the image to be missed; the user can add images to the allowlist manually.
   _extract_mcp_docker_images() {
     local file="$1"
     [[ -f "$file" ]] || return
@@ -163,9 +176,9 @@ derive_docker_allowlist() {
         elif $arg == "run" then .state = "scanning"
         elif ($arg | test("^--?[a-zA-Z]")) then
           # Flags that take a value: skip the next arg
-          if ($arg | test("^--(network|name|env|volume|workdir|user|entrypoint|label|mount|publish|expose|hostname|domainname|memory|cpus|platform|pull|runtime|security-opt|ulimit|log-driver|log-opt|pid|uts|ipc|cgroupns|restart|stop-signal|stop-timeout)=")) then .
-          elif ($arg | test("^-[evpw]$")) then {state: "skip_next", image: null}
-          elif ($arg | test("^--(network|name|env|volume|workdir|user|entrypoint|label|mount|publish|expose|hostname)$")) then {state: "skip_next", image: null}
+          if ($arg | test("^--(network|name|env|volume|workdir|user|entrypoint|label|mount|publish|expose|hostname|domainname|memory|cpus|platform|pull|runtime|security-opt|ulimit|log-driver|log-opt|pid|uts|ipc|cgroupns|restart|stop-signal|stop-timeout|memory-swap|cpu-shares|shm-size|pids-limit|tmpfs|add-host|dns|mac-address|cap-add|cap-drop|device|cidfile)=")) then .
+          elif ($arg | test("^-[evpwumlh]$")) then {state: "skip_next", image: null}
+          elif ($arg | test("^--(network|name|env|volume|workdir|user|entrypoint|label|mount|publish|expose|hostname|domainname|memory|cpus|platform|pull|runtime|security-opt|ulimit|log-driver|log-opt|pid|uts|ipc|cgroupns|restart|stop-signal|stop-timeout|memory-swap|cpu-shares|shm-size|pids-limit|tmpfs|add-host|dns|mac-address|cap-add|cap-drop|device|cidfile)$")) then {state: "skip_next", image: null}
           else .
           end
         elif ($arg | test("^-")) then .
@@ -256,6 +269,13 @@ start_docker_guard() {
     exit 1
   fi
 
+  # Verify the guard process is still alive after socket appeared
+  if ! kill -0 "$BW_GUARD_PID" 2>/dev/null; then
+    echo "Error: bw-docker-guard exited unexpectedly" >&2
+    rm -f "$BW_GUARD_SOCKET"
+    exit 1
+  fi
+
   # Inside the sandbox, the socket is bind-mounted to a fixed path
   BW_DOCKER_HOST="unix:///run/bw-docker-guard.sock"
 }
@@ -264,6 +284,20 @@ cleanup_docker_guard() {
   [[ -n "${BW_GUARD_PID:-}" ]] && kill "$BW_GUARD_PID" 2>/dev/null
   [[ -n "${BW_GUARD_SOCKET:-}" ]] && rm -f "$BW_GUARD_SOCKET"
   [[ -n "${BW_DOCKER_GUARD_CONFIG:-}" ]] && rm -f "$BW_DOCKER_GUARD_CONFIG"
+}
+
+# --- Docker overlay bind helper ---
+# Adds the appropriate Docker socket bind to the OVERLAY_BINDS array.
+# Call after parse_bw_flags, passing the OVERLAY_BINDS array name.
+add_docker_overlay_bind() {
+  local -n _overlay=$1
+  if [[ "$BW_FULL_DOCKER" == true ]]; then
+    # --full-docker: mount raw Docker socket (unrestricted access)
+    _overlay+=("rw /run/docker.sock")
+  elif [[ -n "${BW_GUARD_SOCKET:-}" ]]; then
+    # Guarded/read-only: bind-mount the guard proxy socket into the sandbox
+    _overlay+=("ro $BW_GUARD_SOCKET /run/bw-docker-guard.sock")
+  fi
 }
 
 # Parse bw-AICode flags from arguments.

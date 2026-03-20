@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -100,8 +101,8 @@ func seedComposeContainers(tracker *ownership.Tracker, dockerSocket, composeProj
 		return fmt.Errorf("marshaling filters: %w", err)
 	}
 
-	url := fmt.Sprintf("http://localhost/containers/json?filters=%s", string(filtersJSON))
-	resp, err := client.Get(url)
+	reqURL := fmt.Sprintf("http://localhost/containers/json?filters=%s", url.QueryEscape(string(filtersJSON)))
+	resp, err := client.Get(reqURL)
 	if err != nil {
 		return fmt.Errorf("querying Docker: %w", err)
 	}

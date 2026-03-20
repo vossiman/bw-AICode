@@ -160,7 +160,7 @@ func TestValidateContainerCreate(t *testing.T) {
 			name:   "volume mounting docker.sock",
 			body:   `{"Image": "postgres:16", "HostConfig": {"Binds": ["/var/run/docker.sock:/var/run/docker.sock"]}}`,
 			allow:  false,
-			reason: "docker.sock",
+			reason: "volume",
 		},
 		// Test 6: Privileged true
 		{
@@ -453,19 +453,22 @@ func TestValidateImagePull(t *testing.T) {
 	})
 }
 
-// Build endpoint
+// T3: Build endpoint unconditionally denied
 func TestValidateBuild(t *testing.T) {
 	v, _ := newTestValidator()
 
-	t.Run("build without host network", func(t *testing.T) {
+	t.Run("build unconditionally denied", func(t *testing.T) {
 		r := makeRequest("POST", "/v1.45/build", "")
 		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("build should be allowed, got deny: %s", d.Reason)
+		if d.Allow {
+			t.Errorf("build should be denied")
+		}
+		if !strings.Contains(strings.ToLower(d.Reason), "build") {
+			t.Errorf("reason should mention build, got: %s", d.Reason)
 		}
 	})
 
-	t.Run("build with host network blocked", func(t *testing.T) {
+	t.Run("build with host network denied", func(t *testing.T) {
 		r := makeRequest("POST", "/v1.45/build?networkmode=host", "")
 		d := v.Validate(r)
 		if d.Allow {
@@ -473,11 +476,19 @@ func TestValidateBuild(t *testing.T) {
 		}
 	})
 
-	t.Run("build with bridge network allowed", func(t *testing.T) {
+	t.Run("build with bridge network denied", func(t *testing.T) {
 		r := makeRequest("POST", "/v1.45/build?networkmode=bridge", "")
 		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("build with bridge network should be allowed, got deny: %s", d.Reason)
+		if d.Allow {
+			t.Errorf("build with any network should be denied")
+		}
+	})
+
+	t.Run("build unversioned denied", func(t *testing.T) {
+		r := makeRequest("POST", "/build", "")
+		d := v.Validate(r)
+		if d.Allow {
+			t.Errorf("unversioned build should be denied")
 		}
 	})
 }
@@ -593,5 +604,130 @@ func TestValidateContainerCreateInvalidJSON(t *testing.T) {
 	d := v.Validate(r)
 	if d.Allow {
 		t.Errorf("invalid JSON body should be denied")
+	}
+}
+
+// T2: VolumesFrom, SecurityOpt, UsernsMode/IpcMode/CgroupnsMode/UTSMode host denied
+func TestValidateContainerCreateNewHostConfigFields(t *testing.T) {
+	v, _ := newTestValidator()
+
+	tests := []struct {
+		name   string
+		body   string
+		reason string
+	}{
+		{
+			name:   "VolumesFrom denied",
+			body:   `{"Image": "postgres:16", "HostConfig": {"VolumesFrom": ["other-container"]}}`,
+			reason: "volumesfrom",
+		},
+		{
+			name:   "SecurityOpt denied",
+			body:   `{"Image": "postgres:16", "HostConfig": {"SecurityOpt": ["apparmor=unconfined"]}}`,
+			reason: "securityopt",
+		},
+		{
+			name:   "UsernsMode host denied",
+			body:   `{"Image": "postgres:16", "HostConfig": {"UsernsMode": "host"}}`,
+			reason: "user namespace",
+		},
+		{
+			name:   "IpcMode host denied",
+			body:   `{"Image": "postgres:16", "HostConfig": {"IpcMode": "host"}}`,
+			reason: "ipc",
+		},
+		{
+			name:   "CgroupnsMode host denied",
+			body:   `{"Image": "postgres:16", "HostConfig": {"CgroupnsMode": "host"}}`,
+			reason: "cgroup",
+		},
+		{
+			name:   "UTSMode host denied",
+			body:   `{"Image": "postgres:16", "HostConfig": {"UTSMode": "host"}}`,
+			reason: "uts",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := makeRequest("POST", "/containers/create", tt.body)
+			d := v.Validate(r)
+			if d.Allow {
+				t.Errorf("expected deny for %s", tt.name)
+			}
+			if !strings.Contains(strings.ToLower(d.Reason), strings.ToLower(tt.reason)) {
+				t.Errorf("reason %q should contain %q", d.Reason, tt.reason)
+			}
+		})
+	}
+
+	// Non-host values should be allowed
+	t.Run("UsernsMode non-host allowed", func(t *testing.T) {
+		r := makeRequest("POST", "/containers/create", `{"Image": "postgres:16", "HostConfig": {"UsernsMode": "private"}}`)
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("non-host UsernsMode should be allowed, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("IpcMode non-host allowed", func(t *testing.T) {
+		r := makeRequest("POST", "/containers/create", `{"Image": "postgres:16", "HostConfig": {"IpcMode": "private"}}`)
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("non-host IpcMode should be allowed, got deny: %s", d.Reason)
+		}
+	})
+}
+
+// T4: /attach, /wait, /logs, /resize — owned allowed, unowned denied
+func TestValidateContainerAccess(t *testing.T) {
+	v, tracker := newTestValidator()
+	tracker.Add("owned123abc")
+
+	operations := []string{"attach", "wait", "logs", "resize"}
+
+	for _, op := range operations {
+		t.Run(op+" owned allowed", func(t *testing.T) {
+			r := makeRequest("POST", "/v1.45/containers/owned123abc/"+op, "")
+			d := v.Validate(r)
+			if !d.Allow {
+				t.Errorf("%s owned container should be allowed, got deny: %s", op, d.Reason)
+			}
+		})
+
+		t.Run(op+" unowned denied", func(t *testing.T) {
+			r := makeRequest("POST", "/v1.45/containers/unknown999/"+op, "")
+			d := v.Validate(r)
+			if d.Allow {
+				t.Errorf("%s unowned container should be denied", op)
+			}
+			if !strings.Contains(strings.ToLower(d.Reason), "not owned") {
+				t.Errorf("reason should mention not owned, got: %s", d.Reason)
+			}
+		})
+
+		t.Run(op+" unversioned owned", func(t *testing.T) {
+			r := makeRequest("POST", "/containers/owned123abc/"+op, "")
+			d := v.Validate(r)
+			if !d.Allow {
+				t.Errorf("unversioned %s owned should be allowed, got deny: %s", op, d.Reason)
+			}
+		})
+	}
+}
+
+// T5: Oversized body (>10MB) denied
+func TestValidateOversizedBody(t *testing.T) {
+	v, _ := newTestValidator()
+
+	// Create a body larger than 10MB
+	bigBody := `{"Image": "postgres:16", "data": "` + strings.Repeat("x", 11*1024*1024) + `"}`
+	r := makeRequest("POST", "/containers/create", bigBody)
+	d := v.Validate(r)
+	if d.Allow {
+		t.Errorf("oversized body should be denied")
+	}
+	if !strings.Contains(strings.ToLower(d.Reason), "body") {
+		t.Errorf("reason should mention body, got: %s", d.Reason)
 	}
 }

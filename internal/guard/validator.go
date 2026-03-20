@@ -13,6 +13,9 @@ import (
 	"github.com/vossi/bw-docker-guard/internal/ownership"
 )
 
+// maxBodySize is the maximum request body size the guard will read (10 MB).
+const maxBodySize = 10 * 1024 * 1024
+
 // Decision represents the result of validating a Docker API request.
 type Decision struct {
 	Allow  bool
@@ -30,18 +33,6 @@ func NewValidator(cfg *config.Config, tracker *ownership.Tracker) *Validator {
 	return &Validator{config: cfg, tracker: tracker}
 }
 
-// URL patterns for Docker API routes (with optional version prefix).
-var (
-	reContainerCreate    = regexp.MustCompile(`^(/v[\d.]+)?/containers/create$`)
-	reContainerAction    = regexp.MustCompile(`^(/v[\d.]+)?/containers/([^/]+)/(start|stop|restart|kill)$`)
-	reContainerDelete    = regexp.MustCompile(`^(/v[\d.]+)?/containers/([^/]+)$`)
-	reContainerExec      = regexp.MustCompile(`^(/v[\d.]+)?/containers/([^/]+)/exec$`)
-	reExecStart          = regexp.MustCompile(`^(/v[\d.]+)?/exec/([^/]+)/start$`)
-	reImagesCreate       = regexp.MustCompile(`^(/v[\d.]+)?/images/create$`)
-	reBuild              = regexp.MustCompile(`^(/v[\d.]+)?/build$`)
-	reNetworkCreate      = regexp.MustCompile(`^(/v[\d.]+)?/networks/create$`)
-)
-
 // deviceMapping mirrors Docker's DeviceMapping struct for JSON parsing.
 type deviceMapping struct {
 	PathOnHost        string `json:"PathOnHost"`
@@ -53,12 +44,18 @@ type deviceMapping struct {
 type containerCreateRequest struct {
 	Image      string `json:"Image"`
 	HostConfig struct {
-		Binds       []string        `json:"Binds"`
-		Privileged  bool            `json:"Privileged"`
-		PidMode     string          `json:"PidMode"`
-		NetworkMode string          `json:"NetworkMode"`
-		CapAdd      []string        `json:"CapAdd"`
-		Devices     []deviceMapping `json:"Devices"`
+		Binds         []string        `json:"Binds"`
+		Privileged    bool            `json:"Privileged"`
+		PidMode       string          `json:"PidMode"`
+		NetworkMode   string          `json:"NetworkMode"`
+		UsernsMode    string          `json:"UsernsMode"`
+		IpcMode       string          `json:"IpcMode"`
+		CgroupnsMode  string          `json:"CgroupnsMode"`
+		UTSMode       string          `json:"UTSMode"`
+		CapAdd        []string        `json:"CapAdd"`
+		Devices       []deviceMapping `json:"Devices"`
+		VolumesFrom   []string        `json:"VolumesFrom"`
+		SecurityOpt   []string        `json:"SecurityOpt"`
 	} `json:"HostConfig"`
 	Mounts []struct {
 		Type   string `json:"Type"`
@@ -85,15 +82,23 @@ func deny(reason string) Decision {
 	return Decision{Allow: false, Reason: reason}
 }
 
-// readBody reads the request body and re-buffers it so the proxy can still forward it.
+// readBody reads the request body (up to maxBodySize) and re-buffers it so the
+// proxy can still forward it. Returns an error if the body exceeds the limit.
 func readBody(r *http.Request) ([]byte, error) {
 	if r.Body == nil {
 		return nil, nil
 	}
-	bodyBytes, err := io.ReadAll(r.Body)
+	limited := io.LimitReader(r.Body, maxBodySize+1)
+	bodyBytes, err := io.ReadAll(limited)
 	r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	return bodyBytes, err
+	if err != nil {
+		return bodyBytes, err
+	}
+	if int64(len(bodyBytes)) > maxBodySize {
+		return nil, fmt.Errorf("request body exceeds %d byte limit", maxBodySize)
+	}
+	return bodyBytes, nil
 }
 
 // Validate inspects the given HTTP request and decides whether to allow or deny it.
@@ -112,29 +117,41 @@ func (v *Validator) Validate(r *http.Request) Decision {
 
 	// 3. Route by URL pattern
 	switch {
-	case reContainerCreate.MatchString(path):
+	case ReContainerCreate.MatchString(path):
 		return v.validateContainerCreate(r)
 
-	case reContainerExec.MatchString(path):
+	case ReContainerExec.MatchString(path):
 		return v.validateContainerExec(r)
 
-	case reContainerAction.MatchString(path):
+	case ReContainerAction.MatchString(path):
 		return v.validateContainerAction(path)
 
-	case r.Method == http.MethodDelete && reContainerDelete.MatchString(path):
+	case r.Method == http.MethodDelete && ReContainerDelete.MatchString(path):
 		return v.validateContainerDelete(path)
 
-	case reExecStart.MatchString(path):
+	case ReExecStart.MatchString(path):
 		return v.validateExecStart(path)
 
-	case reImagesCreate.MatchString(path):
+	case ReImagesCreate.MatchString(path):
 		return v.validateImageCreate(r)
 
-	case reBuild.MatchString(path):
-		return v.validateBuild(r)
+	case ReBuild.MatchString(path):
+		return deny("build is not allowed through the guard proxy")
 
-	case reNetworkCreate.MatchString(path):
+	case ReNetworkCreate.MatchString(path):
 		return v.validateNetworkCreate(r)
+
+	case ReContainerAttach.MatchString(path):
+		return v.validateContainerAccess(path, ReContainerAttach, "attach")
+
+	case ReContainerWait.MatchString(path):
+		return v.validateContainerAccess(path, ReContainerWait, "wait")
+
+	case ReContainerLogs.MatchString(path):
+		return v.validateContainerAccess(path, ReContainerLogs, "logs")
+
+	case ReContainerResize.MatchString(path):
+		return v.validateContainerAccess(path, ReContainerResize, "resize")
 
 	default:
 		return deny("operation not allowed")
@@ -160,9 +177,6 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	// Check bind mounts (HostConfig.Binds)
 	for _, bind := range req.HostConfig.Binds {
 		hostPath := strings.SplitN(bind, ":", 2)[0]
-		if strings.Contains(hostPath, "docker.sock") {
-			return deny(fmt.Sprintf("mounting docker.sock is not allowed: %s", bind))
-		}
 		if !v.config.IsVolumePathAllowed(hostPath) {
 			return deny(fmt.Sprintf("volume mount path %q is not allowed", hostPath))
 		}
@@ -171,9 +185,6 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	// Check Mounts array (newer Docker API)
 	for _, mount := range req.Mounts {
 		if mount.Type == "bind" {
-			if strings.Contains(mount.Source, "docker.sock") {
-				return deny(fmt.Sprintf("mounting docker.sock is not allowed: %s", mount.Source))
-			}
 			if !v.config.IsVolumePathAllowed(mount.Source) {
 				return deny(fmt.Sprintf("volume mount path %q is not allowed", mount.Source))
 			}
@@ -195,6 +206,26 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 		return deny("host network mode is not allowed")
 	}
 
+	// Check UsernsMode
+	if req.HostConfig.UsernsMode == "host" {
+		return deny("host user namespace is not allowed")
+	}
+
+	// Check IpcMode
+	if req.HostConfig.IpcMode == "host" {
+		return deny("host IPC mode is not allowed")
+	}
+
+	// Check CgroupnsMode
+	if req.HostConfig.CgroupnsMode == "host" {
+		return deny("host cgroup namespace is not allowed")
+	}
+
+	// Check UTSMode
+	if req.HostConfig.UTSMode == "host" {
+		return deny("host UTS mode is not allowed")
+	}
+
 	// Check CapAdd
 	if len(req.HostConfig.CapAdd) > 0 {
 		return deny(fmt.Sprintf("adding capabilities is not allowed: %v", req.HostConfig.CapAdd))
@@ -205,11 +236,21 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 		return deny("device mappings are not allowed")
 	}
 
+	// Check VolumesFrom
+	if len(req.HostConfig.VolumesFrom) > 0 {
+		return deny("VolumesFrom is not allowed")
+	}
+
+	// Check SecurityOpt
+	if len(req.HostConfig.SecurityOpt) > 0 {
+		return deny("SecurityOpt is not allowed")
+	}
+
 	return allow("container create allowed")
 }
 
 func (v *Validator) validateContainerAction(path string) Decision {
-	matches := reContainerAction.FindStringSubmatch(path)
+	matches := ReContainerAction.FindStringSubmatch(path)
 	if matches == nil {
 		return deny("operation not allowed")
 	}
@@ -224,7 +265,7 @@ func (v *Validator) validateContainerAction(path string) Decision {
 }
 
 func (v *Validator) validateContainerDelete(path string) Decision {
-	matches := reContainerDelete.FindStringSubmatch(path)
+	matches := ReContainerDelete.FindStringSubmatch(path)
 	if matches == nil {
 		return deny("operation not allowed")
 	}
@@ -238,7 +279,7 @@ func (v *Validator) validateContainerDelete(path string) Decision {
 }
 
 func (v *Validator) validateContainerExec(r *http.Request) Decision {
-	matches := reContainerExec.FindStringSubmatch(r.URL.Path)
+	matches := ReContainerExec.FindStringSubmatch(r.URL.Path)
 	if matches == nil {
 		return deny("operation not allowed")
 	}
@@ -267,7 +308,7 @@ func (v *Validator) validateContainerExec(r *http.Request) Decision {
 }
 
 func (v *Validator) validateExecStart(path string) Decision {
-	matches := reExecStart.FindStringSubmatch(path)
+	matches := ReExecStart.FindStringSubmatch(path)
 	if matches == nil {
 		return deny("operation not allowed")
 	}
@@ -293,15 +334,6 @@ func (v *Validator) validateImageCreate(r *http.Request) Decision {
 	return allow("image pull allowed")
 }
 
-func (v *Validator) validateBuild(r *http.Request) Decision {
-	networkMode := r.URL.Query().Get("networkmode")
-	if networkMode == "host" {
-		return deny("host network mode is not allowed for builds")
-	}
-
-	return allow("build allowed")
-}
-
 func (v *Validator) validateNetworkCreate(r *http.Request) Decision {
 	bodyBytes, err := readBody(r)
 	if err != nil {
@@ -318,4 +350,20 @@ func (v *Validator) validateNetworkCreate(r *http.Request) Decision {
 	}
 
 	return allow("network create allowed")
+}
+
+// validateContainerAccess checks ownership for container endpoints that take
+// a container ID in position 2 of the regex match (attach, wait, logs, resize).
+func (v *Validator) validateContainerAccess(path string, re *regexp.Regexp, operation string) Decision {
+	matches := re.FindStringSubmatch(path)
+	if matches == nil {
+		return deny("operation not allowed")
+	}
+	containerID := matches[2]
+
+	if !v.tracker.IsOwned(containerID) {
+		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+	}
+
+	return allow(fmt.Sprintf("container %s allowed", operation))
 }

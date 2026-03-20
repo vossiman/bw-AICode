@@ -25,13 +25,7 @@ OVERLAY_BINDS=(
   "${COMMON_OVERLAY_BINDS[@]}"
 )
 
-if [[ "$BW_FULL_DOCKER" == true ]]; then
-  # --full-docker: mount raw Docker socket (unrestricted access)
-  OVERLAY_BINDS+=("rw /run/docker.sock")
-elif [[ -n "${BW_GUARD_SOCKET:-}" ]]; then
-  # Guarded/read-only: bind-mount the guard proxy socket into the sandbox
-  OVERLAY_BINDS+=("ro $BW_GUARD_SOCKET /run/bw-docker-guard.sock")
-fi
+add_docker_overlay_bind OVERLAY_BINDS
 
 build_bwrap_args BINDS BWRAP_ARGS
 build_bwrap_args OVERLAY_BINDS BWRAP_OVERLAY_ARGS

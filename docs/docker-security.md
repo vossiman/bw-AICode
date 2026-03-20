@@ -141,9 +141,10 @@ From these, the proxy extracts: allowed images, allowed networks, compose projec
 The proxy is **deny-by-default**. Only explicitly modeled operations are allowed:
 
 - **Read operations** (GET/HEAD): always allowed
-- **Container create**: image must be in allowlist, volume mounts must be under project directory, dangerous flags blocked (`--privileged`, `--pid=host`, `--network=host`, `--cap-add`, `--device`)
-- **Container lifecycle** (start/stop/restart/kill/exec/rm): only on containers owned by this session (created through the proxy or belonging to the compose project)
+- **Container create**: image must be in allowlist, volume mounts must be under project directory (symlink-resolved), dangerous flags blocked (`--privileged`, `--pid=host`, `--network=host`, `--userns=host`, `--ipc=host`, `--cgroupns=host`, `--uts=host`, `--cap-add`, `--device`, `--volumes-from`, `--security-opt`)
+- **Container lifecycle** (start/stop/restart/kill/attach/wait/logs/resize/exec/rm): only on containers owned by this session (created through the proxy or belonging to the compose project)
 - **Image pull**: only allowlisted images
+- **Build**: unconditionally blocked (use `--full-docker` if builds are needed)
 - **Network create/delete**: only allowlisted networks
 - **Everything else**: blocked (Swarm, secrets, plugins, volume create, etc.)
 
@@ -151,14 +152,20 @@ The proxy is **deny-by-default**. Only explicitly modeled operations are allowed
 
 | Escape vector | How it's blocked |
 |---|---|
-| Arbitrary volume mount (`-v /:/host`) | Only mounts under project directory allowed |
+| Arbitrary volume mount (`-v /:/host`) | Only mounts under project directory allowed (symlink-resolved) |
+| Symlink traversal (`-v /project/link-to-root:/host`) | `filepath.EvalSymlinks` resolves before path check |
 | Privileged container | `Privileged` flag rejected in request body |
 | Host PID/network namespace | `PidMode: host`, `NetworkMode: host` rejected |
+| Host user/IPC/cgroup/UTS namespace | `UsernsMode`, `IpcMode`, `CgroupnsMode`, `UTSMode` host values rejected |
 | Arbitrary image | Only allowlisted images can be pulled or used |
 | Capability escalation | `CapAdd` rejected |
 | Device access | `Devices` rejected |
+| Volume inheritance | `VolumesFrom` rejected |
+| Security option override | `SecurityOpt` rejected |
+| Docker build | `/build` unconditionally blocked |
 | Exec into non-project container | Container ownership tracking |
-| Docker socket in container | Mount of `docker.sock` rejected |
+| Docker/Podman socket in container | Socket paths detected by basename and known absolute paths |
+| Oversized request body | 10 MB body size limit on all write requests |
 
 ### What it doesn't protect against
 
