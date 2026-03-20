@@ -476,38 +476,28 @@ func TestValidateImagePull(t *testing.T) {
 func TestValidateBuild(t *testing.T) {
 	v, _ := newTestValidator()
 
-	t.Run("build unconditionally denied", func(t *testing.T) {
-		r := makeRequest("POST", "/v1.45/build", "")
+	t.Run("build allowed in guarded mode", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/build?t=myimage:latest", "")
 		d := v.Validate(r)
-		if d.Allow {
-			t.Errorf("build should be denied")
-		}
-		if !strings.Contains(strings.ToLower(d.Reason), "build") {
-			t.Errorf("reason should mention build, got: %s", d.Reason)
+		if !d.Allow {
+			t.Errorf("build should be allowed in guarded mode, got deny: %s", d.Reason)
 		}
 	})
 
-	t.Run("build with host network denied", func(t *testing.T) {
-		r := makeRequest("POST", "/v1.45/build?networkmode=host", "")
+	t.Run("build unversioned allowed", func(t *testing.T) {
+		r := makeRequest("POST", "/build?t=myimage:latest", "")
 		d := v.Validate(r)
-		if d.Allow {
-			t.Errorf("build with host network should be denied")
+		if !d.Allow {
+			t.Errorf("unversioned build should be allowed in guarded mode, got deny: %s", d.Reason)
 		}
 	})
 
-	t.Run("build with bridge network denied", func(t *testing.T) {
-		r := makeRequest("POST", "/v1.45/build?networkmode=bridge", "")
-		d := v.Validate(r)
+	t.Run("build denied in read-only mode", func(t *testing.T) {
+		rv := newReadOnlyValidator()
+		r := makeRequest("POST", "/v1.45/build?t=myimage:latest", "")
+		d := rv.Validate(r)
 		if d.Allow {
-			t.Errorf("build with any network should be denied")
-		}
-	})
-
-	t.Run("build unversioned denied", func(t *testing.T) {
-		r := makeRequest("POST", "/build", "")
-		d := v.Validate(r)
-		if d.Allow {
-			t.Errorf("unversioned build should be denied")
+			t.Errorf("build should be denied in read-only mode")
 		}
 	})
 }

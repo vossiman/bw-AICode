@@ -137,7 +137,7 @@ func (v *Validator) Validate(r *http.Request) Decision {
 		return v.validateImageCreate(r)
 
 	case ReBuild.MatchString(path):
-		return deny("build is not allowed through the guard proxy")
+		return v.validateBuild(r)
 
 	case ReNetworkCreate.MatchString(path):
 		return v.validateNetworkCreate(r)
@@ -330,6 +330,17 @@ func (v *Validator) validateExecStart(path string) Decision {
 	}
 
 	return allow("exec start allowed")
+}
+
+func (v *Validator) validateBuild(r *http.Request) Decision {
+	// Builds are allowed in guarded mode (images are in the allowlist).
+	// Building an image is safe — the danger is in running containers with
+	// bad mounts/privileges, which is validated separately at container create.
+	// In read-only mode, builds are blocked.
+	if v.config.IsReadOnly() {
+		return deny("build is not allowed in read-only mode")
+	}
+	return allow("build allowed")
 }
 
 func (v *Validator) validateImageCreate(r *http.Request) Decision {
