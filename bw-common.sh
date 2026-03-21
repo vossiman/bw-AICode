@@ -163,7 +163,7 @@ derive_docker_allowlist() {
   # the image to be missed; the user can add images to the allowlist manually.
   _extract_mcp_docker_images() {
     local file="$1"
-    [[ -f "$file" ]] || return
+    [[ -f "$file" ]] || return 0
     # Find entries where command is "docker", extract the image from args.
     # The image is the first arg that isn't a flag (doesn't start with -)
     # and isn't a flag value (not preceded by a flag that takes a value).
