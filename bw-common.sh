@@ -300,15 +300,121 @@ add_docker_overlay_bind() {
   fi
 }
 
+# --- Sensitive file deny list ---
+# Default basename patterns (glob syntax) to block AI tools from reading/writing.
+# Per-project overrides via .bw-deny-files in the project root.
+BW_DENY_FILE_DEFAULTS=(
+  # Environment files
+  ".env"
+  ".env.local"
+  ".env.*.local"
+  ".env.production"
+  ".env.development"
+  ".env.staging"
+  ".env.secret"
+  ".envrc"
+
+  # Private keys
+  "id_rsa"
+  "id_ed25519"
+  "id_ecdsa"
+  "id_dsa"
+  "*.pem"
+  "*.key"
+  "*.p12"
+  "*.pfx"
+
+  # Credentials & secrets
+  "credentials.json"
+  "service-account*.json"
+  ".secrets.json"
+  "secrets.json"
+
+  # Auth configs
+  ".netrc"
+  ".pypirc"
+  ".htpasswd"
+  ".pgpass"
+
+  # Cloud / infra
+  "terraform.tfvars"
+  "*.tfvars"
+)
+
+# Load deny patterns: merge defaults with per-project .bw-deny-files overrides.
+# Writes resolved patterns to a temp file and sets BW_DENY_PATTERNS_FILE.
+load_deny_patterns() {
+  local -A patterns=()
+
+  # Start with defaults
+  for p in "${BW_DENY_FILE_DEFAULTS[@]}"; do
+    patterns["$p"]=1
+  done
+
+  # Apply per-project overrides
+  local override_file="$STARTDIR/.bw-deny-files"
+  if [[ -f "$override_file" ]]; then
+    local first_line=true
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      # Strip inline comments and trailing whitespace
+      line="${line%%#*}"
+      line="${line%"${line##*[![:space:]]}"}"
+      [[ -z "$line" ]] && continue
+
+      # !reset clears defaults (must be first non-empty line)
+      if [[ "$first_line" == true && "$line" == "!reset" ]]; then
+        patterns=()
+        first_line=false
+        continue
+      fi
+      first_line=false
+
+      case "$line" in
+        -\ *|-[[:space:]]*)
+          # Remove pattern
+          local pat="${line#-}"
+          pat="${pat#"${pat%%[![:space:]]*}"}"
+          unset "patterns[$pat]"
+          ;;
+        +\ *|+[[:space:]]*)
+          # Add pattern
+          local pat="${line#+}"
+          pat="${pat#"${pat%%[![:space:]]*}"}"
+          patterns["$pat"]=1
+          ;;
+        *)
+          # Bare line = add
+          patterns["$line"]=1
+          ;;
+      esac
+    done < "$override_file"
+  fi
+
+  # Write to temp file
+  BW_DENY_PATTERNS_FILE="$(mktemp /tmp/bw-deny-patterns-XXXXXX.txt)"
+  for p in "${!patterns[@]}"; do
+    echo "$p"
+  done > "$BW_DENY_PATTERNS_FILE"
+}
+
+# Extended cleanup: docker guard + deny patterns temp file
+cleanup_bw() {
+  cleanup_docker_guard
+  [[ -n "${BW_DENY_PATTERNS_FILE:-}" ]] && rm -f "$BW_DENY_PATTERNS_FILE"
+}
+
 # Parse bw-AICode flags from arguments.
 # Sets: BW_FULL_DOCKER (bool), BW_DOCKER_HOST (env value), BW_TOOL_ARGS (passthrough),
-#       BW_DOCKER_MODE ("guarded"|"readonly"|"full"), BW_GUARD_PID, BW_GUARD_SOCKET
+#       BW_DOCKER_MODE ("guarded"|"readonly"|"full"), BW_GUARD_PID, BW_GUARD_SOCKET,
+#       BW_NO_DENY_FILES (bool)
 parse_bw_flags() {
   BW_FULL_DOCKER=false
+  BW_NO_DENY_FILES=false
   BW_TOOL_ARGS=()
   for arg in "$@"; do
     case "$arg" in
       --full-docker) BW_FULL_DOCKER=true ;;
+      --no-deny-files) BW_NO_DENY_FILES=true ;;
       *) BW_TOOL_ARGS+=("$arg") ;;
     esac
   done

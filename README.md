@@ -9,6 +9,7 @@ Bubblewrap (`bwrap`) sandbox wrappers for AI coding tools. Runs Claude Code and 
 - Tool-specific config/state dirs mounted read-write as needed
 - IPC/PID namespaces isolated (user namespace preserved for docker group)
 - Docker API access via `bw-docker-guard` proxy (auto-detects allowed containers from project config)
+- Sensitive file deny hooks block AI tools from reading/writing `.env`, private keys, credentials, etc.
 - Tmux socket isolated from host sessions
 
 ## Scripts
@@ -19,7 +20,8 @@ Bubblewrap (`bwrap`) sandbox wrappers for AI coding tools. Runs Claude Code and 
 | `opencode-bw.sh` | Sandbox wrapper for OpenCode. |
 | `bw-common.sh` | Shared library — common bind definitions, Docker allowlist derivation, and builder function. Sourced by the wrapper scripts, not executable. |
 | `cmd/bw-docker-guard/` | Go source for the Docker API guard proxy. Built by `install.sh`. |
-| `install.sh` | Builds `bw-docker-guard` and symlinks the wrappers into `~/.local/bin`. |
+| `hooks/bw-deny-files.sh` | Claude Code `PreToolUse` hook — blocks access to sensitive files inside the sandbox. |
+| `install.sh` | Builds `bw-docker-guard`, installs hooks, and symlinks the wrappers into `~/.local/bin`. |
 
 ## Install
 
@@ -29,10 +31,12 @@ cd ~/local_dev/bw-AICode
 ./install.sh
 ```
 
-This builds `bw-docker-guard` and creates symlinks in `~/.local/bin/`:
+This builds `bw-docker-guard`, installs the deny-files hook, and creates symlinks in `~/.local/bin/`:
 - `claude-bw` -> `claude-bw.sh`
 - `opencode-bw` -> `opencode-bw.sh`
 - `bw-docker-guard` (built binary)
+- `~/.claude/hooks/bw-deny-files.sh` (Claude Code hook)
+- `PreToolUse` hook registered in `~/.claude/settings.json`
 
 **Dependencies:** `bwrap` (bubblewrap), `go` (1.22+), `jq`, `docker` (optional).
 
@@ -74,6 +78,58 @@ opencode-bw --full-docker      # same for OpenCode
 ```
 
 This mounts the raw Docker socket into the sandbox. **Warning:** this effectively gives the AI root access on the host via `docker run -v /:/host`. Only use this if you trust the AI tool completely or need Docker features that the guard proxy doesn't support.
+
+## Sensitive file deny list
+
+Even inside the writable `~/local_dev` area, the sandbox blocks AI tools from reading or writing sensitive files. This is a defense-in-depth layer on top of the filesystem sandbox.
+
+**Default denied patterns:**
+
+| Category | Patterns |
+|---|---|
+| Environment files | `.env`, `.env.local`, `.env.*.local`, `.env.production`, `.env.development`, `.env.staging`, `.env.secret`, `.envrc` |
+| Private keys | `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, `*.pem`, `*.key`, `*.p12`, `*.pfx` |
+| Credentials | `credentials.json`, `service-account*.json`, `.secrets.json`, `secrets.json` |
+| Auth configs | `.netrc`, `.pypirc`, `.htpasswd`, `.pgpass` |
+| Cloud / infra | `terraform.tfvars`, `*.tfvars` |
+
+**How it works:**
+- **Claude Code:** A `PreToolUse` hook intercepts Read, Edit, Write, Bash, and Grep tool calls. Matches file paths (and Bash command arguments) against the deny list.
+- **OpenCode:** Permission rules are injected via `OPENCODE_PERMISSION` with per-pattern `read`/`edit` denials.
+
+### Per-project overrides
+
+Create a `.bw-deny-files` file in your project root to add or remove patterns:
+
+```bash
+# Add custom patterns
++ vault-token
++ *.credentials
+
+# Remove a default (e.g., you need direnv)
+- .envrc
+
+# Use !reset as the first line to clear ALL defaults
+# !reset
+# + only-this-one
+```
+
+Lines starting with `+` add patterns, `-` removes patterns, bare lines add. Comments with `#`.
+
+### Disabling the deny list
+
+Pass `--no-deny-files` to bypass the deny list entirely:
+
+```bash
+claude-bw --no-deny-files
+opencode-bw --no-deny-files
+```
+
+### Limitations
+
+- **Bash bypass is partial** — common commands (`cat`, `head`, `tail`, `grep`, `sed`, etc.) and redirections (`< file`, `> file`) are caught, but exotic constructs (`python -c "open('.env').read()"`, `base64 .env`) are not. The bwrap sandbox is the primary security boundary; deny hooks are defense-in-depth.
+- **Basename matching only** — a pattern like `.env` blocks all files named `.env` anywhere in the project tree. Path-specific rules are not supported.
+- **Grep on directories** — grepping a directory that contains a denied file is not blocked (only direct grep on a denied file is caught).
 
 ## Adding bind mounts
 
