@@ -9,6 +9,11 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "$SCRIPT_DIR/bw-common.sh"
 parse_bw_flags "$@"
 
+# Load sensitive file deny patterns (unless --no-deny-files)
+if [[ "$BW_NO_DENY_FILES" != true ]]; then
+  load_deny_patterns
+fi
+
 # Tool-specific binds (added to common)
 BINDS=(
   "${COMMON_BINDS[@]}"
@@ -35,6 +40,11 @@ OVERLAY_BINDS=(
 
 add_docker_overlay_bind OVERLAY_BINDS
 
+# Bind-mount deny patterns file into sandbox (read-only, under /tmp so it's an overlay)
+if [[ -n "${BW_DENY_PATTERNS_FILE:-}" ]]; then
+  OVERLAY_BINDS+=("ro $BW_DENY_PATTERNS_FILE")
+fi
+
 build_bwrap_args BINDS BWRAP_ARGS
 build_bwrap_args OVERLAY_BINDS BWRAP_OVERLAY_ARGS
 
@@ -57,6 +67,7 @@ BWRAP_CMD=(
   --setenv CLAUDE_CODE_DISABLE_AUTO_MEMORY 0
   --setenv TMUX_TMPDIR "/tmp/tmux-claude-$(id -u)"
   --setenv CLAUDE_CODE_SPAWN_BACKEND "tmux"
+  ${BW_DENY_PATTERNS_FILE:+--setenv BW_DENY_PATTERNS_FILE "$BW_DENY_PATTERNS_FILE"}
   --setenv DOCKER_HOST "$BW_DOCKER_HOST"
   --chdir "$STARTDIR"
   --unshare-ipc
@@ -65,11 +76,11 @@ BWRAP_CMD=(
   claude --dangerously-skip-permissions "${BW_TOOL_ARGS[@]}"
 )
 
-if [[ -n "${BW_GUARD_PID:-}" ]]; then
-  # Guard proxy is running — use foreground bwrap so cleanup trap fires on exit
-  trap cleanup_docker_guard EXIT
+if [[ -n "${BW_GUARD_PID:-}" || -n "${BW_DENY_PATTERNS_FILE:-}" ]]; then
+  # Resources to clean up — use foreground bwrap so cleanup trap fires on exit
+  trap cleanup_bw EXIT
   "${BWRAP_CMD[@]}"
 else
-  # --full-docker or guard not needed — exec replaces this process
+  # Nothing to clean up — exec replaces this process
   exec "${BWRAP_CMD[@]}"
 fi

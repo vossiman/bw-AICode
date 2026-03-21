@@ -15,7 +15,7 @@ CYAN='\033[0;36m'
 RESET='\033[0m'
 
 step=0
-total=5
+total=7
 
 header() {
   echo ""
@@ -78,7 +78,53 @@ else
   err "go not found — needed to build bw-docker-guard (install Go 1.22+)"
 fi
 
-# --- Step 4: Verify PATH ---
+# --- Step 4: Install deny-files hook ---
+step "Installing deny-files hook"
+HOOKS_DIR="$HOME/.claude/hooks"
+mkdir -p "$HOOKS_DIR"
+cp "$SCRIPT_DIR/hooks/bw-deny-files.sh" "$HOOKS_DIR/bw-deny-files.sh"
+chmod +x "$HOOKS_DIR/bw-deny-files.sh"
+ok "bw-deny-files.sh -> $HOOKS_DIR/"
+
+# --- Step 5: Register PreToolUse hook in Claude settings ---
+step "Registering Claude Code hook"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+if command -v jq &>/dev/null; then
+  # Create settings file if missing
+  if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
+    echo '{}' > "$CLAUDE_SETTINGS"
+  fi
+
+  # Check if our hook is already registered
+  HOOK_CMD="bash \"$HOOKS_DIR/bw-deny-files.sh\""
+  if jq -e --arg cmd "$HOOK_CMD" '
+    .hooks.PreToolUse // [] | any(
+      .hooks // [] | any(.command == $cmd)
+    )' "$CLAUDE_SETTINGS" &>/dev/null; then
+    ok "PreToolUse hook already registered"
+  else
+    # Merge our hook into the existing settings
+    MERGED="$(jq --arg cmd "$HOOK_CMD" '
+      .hooks.PreToolUse = (.hooks.PreToolUse // []) + [
+        {
+          "matcher": "Read|Edit|Write|Bash|Grep",
+          "hooks": [
+            {
+              "type": "command",
+              "command": $cmd
+            }
+          ]
+        }
+      ]
+    ' "$CLAUDE_SETTINGS")"
+    echo "$MERGED" > "$CLAUDE_SETTINGS"
+    ok "PreToolUse hook registered in $CLAUDE_SETTINGS"
+  fi
+else
+  warn "jq not found — cannot register hook in $CLAUDE_SETTINGS (add manually)"
+fi
+
+# --- Step 6: Verify PATH ---
 step "Checking PATH"
 if [[ ":$PATH:" == *":$BIN_DIR:"* ]]; then
   ok "$BIN_DIR is in PATH"
@@ -86,7 +132,7 @@ else
   warn "$BIN_DIR is not in PATH — add it to your shell profile"
 fi
 
-# --- Step 5: Checking dependencies ---
+# --- Step 7: Checking dependencies ---
 step "Checking dependencies"
 
 if command -v bwrap &>/dev/null; then
