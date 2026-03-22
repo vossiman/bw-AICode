@@ -68,6 +68,7 @@ BWRAP_CMD=(
   "${BWRAP_ARGS[@]}"
   --proc /proc
   --dev /dev
+  --tmpfs /dev/shm
   --tmpfs /tmp
   --tmpfs /run
   "${BWRAP_OVERLAY_ARGS[@]}"

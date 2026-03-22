@@ -53,6 +53,7 @@ BWRAP_CMD=(
   "${BWRAP_ARGS[@]}"
   --proc /proc
   --dev /dev
+  --tmpfs /dev/shm
   --tmpfs /tmp
   --tmpfs /run
   "${BWRAP_OVERLAY_ARGS[@]}"
@@ -68,6 +69,8 @@ BWRAP_CMD=(
   --setenv TMUX_TMPDIR "/tmp/tmux-claude-$(id -u)"
   --setenv CLAUDE_CODE_SPAWN_BACKEND "tmux"
   ${BW_DENY_PATTERNS_FILE:+--setenv BW_DENY_PATTERNS_FILE "$BW_DENY_PATTERNS_FILE"}
+  --setenv PLAYWRIGHT_MCP_BROWSER chromium
+  --setenv PLAYWRIGHT_MCP_SANDBOX false
   --setenv DOCKER_HOST "$BW_DOCKER_HOST"
   --chdir "$STARTDIR"
   --unshare-ipc

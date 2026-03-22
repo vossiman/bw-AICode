@@ -47,8 +47,9 @@ COMMON_BINDS=(
   "ro $HOME/.npmrc"
   "rw $HOME/.local/share/pnpm"
 
-  # Playwright browsers (read-only — install/update outside sandbox)
-  "ro $HOME/.cache/ms-playwright"
+  # Playwright / Chrome
+  "rw $HOME/.cache/ms-playwright"
+  "ro /opt/google"
 
   # Python / uv
   "ro $HOME/python3.14"
@@ -61,6 +62,13 @@ COMMON_BINDS=(
 COMMON_OVERLAY_BINDS=(
   # Docker API: accessed via bw-docker-guard proxy (Unix socket) or raw socket
   # (--full-docker). The guard socket is added dynamically by start_docker_guard().
+
+  # X11 display socket — needed for GUI apps (e.g. Playwright/Chrome)
+  "ro /tmp/.X11-unix"
+
+  # D-Bus sockets — Chrome and other GUI apps need these
+  "ro /run/dbus"
+  "ro /run/user/$(id -u)/bus"
 
   # systemd runtime — skip if not present
   "ro /run/systemd"
