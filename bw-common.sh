@@ -53,7 +53,8 @@ COMMON_BINDS=(
 
   # Python / uv
   "ro $HOME/python3.14"
-  "ro $HOME/.local/share/uv"
+  "rw $HOME/.local/share/uv"
+  "rw $HOME/.cache/uv"
 )
 
 # --- Overlay bind definitions ---
