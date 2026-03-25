@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"os/signal"
 	"syscall"
 
@@ -122,7 +123,8 @@ func seedComposeContainers(tracker *ownership.Tracker, dockerSocket, composeProj
 	}
 
 	var containers []struct {
-		ID string `json:"Id"`
+		ID    string   `json:"Id"`
+		Names []string `json:"Names"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
 		return fmt.Errorf("parsing response: %w", err)
@@ -130,6 +132,14 @@ func seedComposeContainers(tracker *ownership.Tracker, dockerSocket, composeProj
 
 	for _, c := range containers {
 		tracker.Add(c.ID)
+		// Also track container names so ownership checks work when
+		// Docker CLI uses names instead of IDs in API URLs.
+		for _, name := range c.Names {
+			name = strings.TrimPrefix(name, "/")
+			if name != "" {
+				tracker.Add(name)
+			}
+		}
 		log.Printf("[bw-docker-guard] seeded compose container: %.12s", c.ID)
 	}
 

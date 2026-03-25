@@ -67,6 +67,11 @@ func NewHandler(cfg *config.Config, tracker *ownership.Tracker, dockerSocketPath
 			}
 			if id != "" {
 				tracker.Add(id)
+				// Also track the container name (from ?name= query param)
+				// so ownership checks work when Docker CLI uses names in API URLs.
+				if name := resp.Request.URL.Query().Get("name"); name != "" {
+					tracker.Add(name)
+				}
 			}
 
 		case guard.ReContainerExec.MatchString(path):

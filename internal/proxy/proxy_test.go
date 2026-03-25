@@ -179,6 +179,78 @@ func TestProxy_ContainerCreateAllowed_TracksID(t *testing.T) {
 	}
 }
 
+// Test 2b: Container create with ?name= tracks the name for ownership
+func TestProxy_ContainerCreateTracksName(t *testing.T) {
+	containerID := "deadbeef1234567890abcdef"
+	dockerSock, cleanup := fakeDocker(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/containers/create") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"Id":"%s","Warnings":[]}`, containerID)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cleanup()
+
+	cfg := newTestConfig()
+	proxySock, tracker, proxyCleanup := startProxy(t, cfg, dockerSock)
+	defer proxyCleanup()
+
+	body := `{"Image":"postgres:16"}`
+	resp := doRequest(t, proxySock, "POST", "/containers/create?name=my-postgres", body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201, got %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	// Verify both ID and name are tracked
+	if !tracker.IsOwned(containerID) {
+		t.Errorf("container ID %q should be tracked", containerID)
+	}
+	if !tracker.IsOwned("my-postgres") {
+		t.Errorf("container name %q should be tracked after create with ?name=", "my-postgres")
+	}
+}
+
+// Test 2c: Container actions work with names, not just IDs
+func TestProxy_ContainerActionByName(t *testing.T) {
+	containerID := "deadbeef1234567890abcdef"
+	dockerSock, cleanup := fakeDocker(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/containers/create") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"Id":"%s","Warnings":[]}`, containerID)
+			return
+		}
+		if r.Method == "POST" && strings.Contains(r.URL.Path, "/start") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cleanup()
+
+	cfg := newTestConfig()
+	proxySock, _, proxyCleanup := startProxy(t, cfg, dockerSock)
+	defer proxyCleanup()
+
+	// Create with a name
+	createResp := doRequest(t, proxySock, "POST", "/containers/create?name=my-postgres", `{"Image":"postgres:16"}`)
+	createResp.Body.Close()
+
+	// Start using the name instead of the ID
+	startResp := doRequest(t, proxySock, "POST", "/containers/my-postgres/start", "")
+	defer startResp.Body.Close()
+
+	if startResp.StatusCode != http.StatusNoContent {
+		bodyBytes, _ := io.ReadAll(startResp.Body)
+		t.Fatalf("start by name: expected 204, got %d: %s", startResp.StatusCode, string(bodyBytes))
+	}
+}
+
 // Test 3: Disallowed POST /containers/create returns 403
 func TestProxy_ContainerCreateDenied(t *testing.T) {
 	dockerSock, cleanup := fakeDocker(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

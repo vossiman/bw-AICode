@@ -84,6 +84,22 @@ func TestTrackerConcurrency(t *testing.T) {
 	wg.Wait()
 }
 
+func TestTrackerNameOwnership(t *testing.T) {
+	tr := New()
+	tr.Add("abc123def456full7890")
+	tr.Add("my-container-name")
+
+	if !tr.IsOwned("my-container-name") {
+		t.Error("expected container name to be owned")
+	}
+	if !tr.IsOwned("abc123def456full7890") {
+		t.Error("expected container ID to still be owned")
+	}
+	if tr.IsOwned("other-container") {
+		t.Error("expected other-container to NOT be owned")
+	}
+}
+
 func TestTrackerEmptyNotOwned(t *testing.T) {
 	tr := New()
 	if tr.IsOwned("anything") {
