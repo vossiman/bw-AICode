@@ -39,10 +39,20 @@ func (c *Config) IsReadOnly() bool {
 	return len(c.AllowedImages) == 0
 }
 
+// normalizeImage strips the default Docker Hub registry prefix so that
+// "docker.io/mcp/postgres" matches allowlist entry "mcp/postgres" and vice versa.
+func normalizeImage(image string) string {
+	image = strings.TrimPrefix(image, "docker.io/")
+	image = strings.TrimPrefix(image, "library/")
+	return image
+}
+
 // IsImageAllowed checks if the given image is in the allowlist.
+// Comparison is normalized: "docker.io/mcp/postgres" matches "mcp/postgres".
 func (c *Config) IsImageAllowed(image string) bool {
+	norm := normalizeImage(image)
 	for _, allowed := range c.AllowedImages {
-		if image == allowed {
+		if norm == normalizeImage(allowed) {
 			return true
 		}
 	}

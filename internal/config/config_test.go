@@ -104,6 +104,23 @@ func TestIsImageAllowed(t *testing.T) {
 	}
 }
 
+func TestIsImageAllowedDockerIOPrefix(t *testing.T) {
+	cfg := &Config{AllowedImages: []string{"mcp/postgres", "library/redis"}}
+
+	// docker.io/ prefix should match
+	if !cfg.IsImageAllowed("docker.io/mcp/postgres") {
+		t.Error("docker.io/mcp/postgres should match mcp/postgres")
+	}
+	// library/ prefix should match
+	if !cfg.IsImageAllowed("docker.io/library/redis") {
+		t.Error("docker.io/library/redis should match library/redis")
+	}
+	// still reject unknown images
+	if cfg.IsImageAllowed("docker.io/evil/image") {
+		t.Error("docker.io/evil/image should NOT be allowed")
+	}
+}
+
 func TestIsNetworkAllowed(t *testing.T) {
 	cfg := &Config{AllowedNetworks: []string{"myproject_default"}}
 
