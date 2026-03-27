@@ -45,6 +45,9 @@ COMMON_BINDS=(
   # Node / npm / pnpm
   "ro $HOME/.npm-global"
   "ro $HOME/.npmrc"
+  "ro $HOME/.npm"
+  "rw $HOME/.npm/_cacache"
+  "rw $HOME/.npm/_logs"
   "rw $HOME/.local/share/pnpm"
 
   # Playwright / Chrome
