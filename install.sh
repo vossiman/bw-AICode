@@ -84,7 +84,7 @@ HOOKS_DIR="$HOME/.claude/hooks"
 mkdir -p "$HOOKS_DIR"
 cp "$SCRIPT_DIR/hooks/bw-deny-files.sh" "$HOOKS_DIR/bw-deny-files.sh"
 chmod +x "$HOOKS_DIR/bw-deny-files.sh"
-ok "bw-deny-files.sh -> $HOOKS_DIR/"
+ok "bw-deny-files.sh copied to $HOOKS_DIR/"
 
 # --- Step 5: Register PreToolUse hook in Claude settings ---
 step "Registering Claude Code hook"
