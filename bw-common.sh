@@ -464,6 +464,64 @@ load_deny_patterns() {
   done > "$BW_DENY_PATTERNS_FILE"
 }
 
+# --- MCP env var loader ---
+# Reads .mcp.json to find ${VAR} references, checks the environment, and
+# loads missing vars from .env. Sets BW_MCP_ENV_ARGS with --setenv flags.
+load_mcp_env_vars() {
+  BW_MCP_ENV_ARGS=()
+
+  local mcp_file="$STARTDIR/.mcp.json"
+  [[ -f "$mcp_file" ]] || return 0
+
+  # Extract all ${VAR_NAME} and ${VAR_NAME:-default} references from string values
+  local needed_vars
+  needed_vars="$(jq -r '.. | strings' "$mcp_file" 2>/dev/null \
+    | grep -oP '\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}' \
+    | sed 's/\${//;s/:-.*//;s/}//' \
+    | sort -u)" || true
+  [[ -z "$needed_vars" ]] && return 0
+
+  # Parse .env file into an associative array (only if it exists)
+  local -A env_file_vars=()
+  local env_file="$STARTDIR/.env"
+  if [[ -f "$env_file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      # Skip blank lines and comments
+      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+      # Strip leading "export "
+      line="${line#export }"
+      # Split on first =
+      local key="${line%%=*}"
+      local val="${line#*=}"
+      # Validate key
+      [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+      # Strip surrounding quotes from value
+      if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+        val="${BASH_REMATCH[1]}"
+      elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+        val="${BASH_REMATCH[1]}"
+      fi
+      env_file_vars["$key"]="$val"
+    done < "$env_file"
+  fi
+
+  # Resolve each needed var
+  local var
+  while IFS= read -r var; do
+    [[ -z "$var" ]] && continue
+    if [[ -n "${!var:-}" ]]; then
+      # Already in environment — pass it through
+      BW_MCP_ENV_ARGS+=(--setenv "$var" "${!var}")
+    elif [[ -n "${env_file_vars[$var]+set}" ]]; then
+      # Found in .env
+      BW_MCP_ENV_ARGS+=(--setenv "$var" "${env_file_vars[$var]}")
+      echo "[bw] MCP env: loaded $var from .env" >&2
+    else
+      echo "[bw] ⚠ MCP env: $var not found (not in environment or .env)" >&2
+    fi
+  done <<< "$needed_vars"
+}
+
 # Extended cleanup: docker guard + deny patterns temp file
 cleanup_bw() {
   cleanup_docker_guard
