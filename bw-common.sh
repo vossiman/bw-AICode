@@ -76,6 +76,9 @@ COMMON_OVERLAY_BINDS=(
 
   # systemd runtime — skip if not present
   "ro /run/systemd"
+
+  # Avahi mDNS socket — needed to resolve .local hostnames (e.g. SSH)
+  "ro /run/avahi-daemon/socket"
 )
 
 # --- Builder function ---
