@@ -14,6 +14,9 @@ if [[ "$BW_NO_DENY_FILES" != true ]]; then
   load_deny_patterns
 fi
 
+# Load MCP env vars from .env if needed
+load_mcp_env_vars
+
 # Tool-specific binds (added to common)
 BINDS=(
   "${COMMON_BINDS[@]}"
@@ -69,6 +72,7 @@ BWRAP_CMD=(
   --setenv TMUX_TMPDIR "/tmp/tmux-claude-$(id -u)"
   --setenv CLAUDE_CODE_SPAWN_BACKEND "tmux"
   ${BW_DENY_PATTERNS_FILE:+--setenv BW_DENY_PATTERNS_FILE "$BW_DENY_PATTERNS_FILE"}
+  "${BW_MCP_ENV_ARGS[@]}"
   --setenv PLAYWRIGHT_MCP_BROWSER chromium
   --setenv PLAYWRIGHT_MCP_SANDBOX false
   --setenv DOCKER_HOST "$BW_DOCKER_HOST"
