@@ -37,6 +37,7 @@ COMMON_BINDS=(
   # Git config + SSH keys (read-only — push needs key access)
   "ro $HOME/.gitconfig"
   "ro $HOME/.config/git"
+  "ro $HOME/.config/gh"
   "ro $HOME/.ssh"
 
   # User-local binaries (e.g. claude CLI)
