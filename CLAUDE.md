@@ -33,3 +33,7 @@ Both scripts share the same pattern:
 - Binds targeting paths under `/tmp` or `/run` must go in the `OVERLAY_BINDS` array (placed after `--tmpfs` in the bwrap command), not `BINDS`.
 - When resources need cleanup (guard proxy or deny patterns temp file), scripts use foreground `bwrap` (not `exec`) so the `cleanup_bw` trap can fire. Otherwise `exec bwrap` is used.
 - The Go proxy code is in `internal/` packages. Run `go test ./...` to verify changes.
+
+## Testing
+
+- **OpenCode MCP connectivity**: `opencode-bw mcp list --print-logs --log-level DEBUG` — shows per-server connection status, stderr from MCP processes, and detailed error messages. This is the primary way to diagnose MCP failures inside the sandbox.

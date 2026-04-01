@@ -45,9 +45,7 @@ COMMON_BINDS=(
   # Node / npm / pnpm
   "ro $HOME/.npm-global"
   "ro $HOME/.npmrc"
-  "ro $HOME/.npm"
-  "rw $HOME/.npm/_cacache"
-  "rw $HOME/.npm/_logs"
+  "rw $HOME/.npm"
   "rw $HOME/.local/share/pnpm"
 
   # Playwright / Chrome
@@ -468,20 +466,59 @@ load_deny_patterns() {
 }
 
 # --- MCP env var loader ---
-# Reads .mcp.json to find ${VAR} references, checks the environment, and
+# Scans MCP config files for env var references, checks the environment, and
 # loads missing vars from .env. Sets BW_MCP_ENV_ARGS with --setenv flags.
+#
+# Supported config formats:
+#   - .mcp.json (Claude Code): ${VAR_NAME} / ${VAR_NAME:-default} in string values
+#   - opencode.json (OpenCode): {env:VAR_NAME} in string values, plus keys in
+#     mcp.*.environment objects
 load_mcp_env_vars() {
   BW_MCP_ENV_ARGS=()
 
-  local mcp_file="$STARTDIR/.mcp.json"
-  [[ -f "$mcp_file" ]] || return 0
+  # Collect env var names from all MCP config files
+  local needed_vars=""
 
-  # Extract all ${VAR_NAME} and ${VAR_NAME:-default} references from string values
-  local needed_vars
-  needed_vars="$(jq -r '.. | strings' "$mcp_file" 2>/dev/null \
-    | grep -oP '\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}' \
-    | sed 's/\${//;s/:-.*//;s/}//' \
-    | sort -u)" || true
+  # --- Claude Code: .mcp.json ---
+  local mcp_file="$STARTDIR/.mcp.json"
+  if [[ -f "$mcp_file" ]]; then
+    local claude_vars
+    claude_vars="$(jq -r '.. | strings' "$mcp_file" 2>/dev/null \
+      | grep -oP '\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}' \
+      | sed 's/\${//;s/:-.*//;s/}//' \
+      | sort -u)" || true
+    [[ -n "$claude_vars" ]] && needed_vars+=$'\n'"$claude_vars"
+  fi
+
+  # --- OpenCode: opencode.json / opencode.jsonc (project + global) ---
+  local oc_file
+  for oc_file in \
+    "$STARTDIR/opencode.json" \
+    "$STARTDIR/.opencode/opencode.json" \
+    "$HOME/.config/opencode/opencode.json" \
+    "$HOME/.config/opencode/opencode.jsonc" \
+    "$HOME/.config/opencode/config.json"; do
+    [[ -f "$oc_file" ]] || continue
+    local oc_vars
+    # {env:VAR_NAME} references anywhere in string values — OpenCode resolves
+    # these from process.env at config load time, so they must be in bwrap env.
+    oc_vars="$(jq -r '.. | strings' "$oc_file" 2>/dev/null \
+      | grep -oP '\{env:([A-Za-z_][A-Za-z0-9_]*)\}' \
+      | sed 's/{env://;s/}//' \
+      | sort -u)" || true
+    [[ -n "$oc_vars" ]] && needed_vars+=$'\n'"$oc_vars"
+    # {env:VAR} references inside mcp.*.environment VALUES — the key names
+    # themselves don't matter (OpenCode passes them to the MCP server directly).
+    local env_val_refs
+    env_val_refs="$(jq -r '.mcp // {} | to_entries[] | .value.environment // {} | to_entries[] | .value' "$oc_file" 2>/dev/null \
+      | grep -oP '\{env:([A-Za-z_][A-Za-z0-9_]*)\}' \
+      | sed 's/{env://;s/}//' \
+      | sort -u)" || true
+    [[ -n "$env_val_refs" ]] && needed_vars+=$'\n'"$env_val_refs"
+  done
+
+  # Deduplicate
+  needed_vars="$(echo "$needed_vars" | grep -v '^$' | sort -u)" || true
   [[ -z "$needed_vars" ]] && return 0
 
   # Parse .env file into an associative array (only if it exists)

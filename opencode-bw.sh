@@ -14,6 +14,9 @@ if [[ "$BW_NO_DENY_FILES" != true ]]; then
   load_deny_patterns
 fi
 
+# Load MCP env vars from .env if needed
+load_mcp_env_vars
+
 # Build OPENCODE_PERMISSION JSON with deny rules for sensitive files
 build_opencode_permission() {
   if [[ -z "${BW_DENY_PATTERNS_FILE:-}" || ! -f "$BW_DENY_PATTERNS_FILE" ]]; then
@@ -50,6 +53,7 @@ BINDS=(
   # OpenCode config/data/cache — rw! creates if missing
   "rw! $HOME/.config/opencode"
   "rw! $HOME/.local/share/opencode"
+  "rw! $HOME/.local/state/opencode"
   "rw! $HOME/.cache/opencode"
 )
 
@@ -80,6 +84,7 @@ BWRAP_CMD=(
   ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"}
   ${BW_VENV_PATH:+--setenv VIRTUAL_ENV "$BW_VENV_PATH"}
   --setenv OPENCODE_PERMISSION "$OPENCODE_PERMISSION_JSON"
+  "${BW_MCP_ENV_ARGS[@]}"
   --setenv DOCKER_HOST "$BW_DOCKER_HOST"
   --chdir "$STARTDIR"
   --unshare-ipc
