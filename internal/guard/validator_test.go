@@ -470,6 +470,87 @@ func TestValidateImagePull(t *testing.T) {
 			t.Errorf("unversioned allowed image pull should be allowed, got deny: %s", d.Reason)
 		}
 	})
+
+	// Docker infrastructure image (moby/buildkit) should be allowed in guarded mode
+	t.Run("buildkit infra image pull allowed", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/images/create?fromImage=docker.io/moby/buildkit", "")
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("moby/buildkit pull should be allowed as docker infra image, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("buildkit infra image pull with tag allowed", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/images/create?fromImage=docker.io/moby/buildkit:buildx-stable-1", "")
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("moby/buildkit:buildx-stable-1 pull should be allowed, got deny: %s", d.Reason)
+		}
+	})
+}
+
+func TestValidateContainerCreateBuildkitInfra(t *testing.T) {
+	v, _ := newTestValidator()
+
+	// Buildkit container creation should be allowed in guarded mode
+	t.Run("buildkit container create allowed", func(t *testing.T) {
+		body := `{"Image": "docker.io/moby/buildkit:buildx-stable-1", "HostConfig": {}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("moby/buildkit container create should be allowed, got deny: %s", d.Reason)
+		}
+	})
+
+	// Buildkit runs privileged — should be allowed as infra image
+	t.Run("buildkit privileged container allowed", func(t *testing.T) {
+		body := `{"Image": "docker.io/moby/buildkit:buildx-stable-1", "HostConfig": {"Privileged": true}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("privileged moby/buildkit should be allowed as docker infra, got deny: %s", d.Reason)
+		}
+	})
+
+	// Non-infra images should still be denied privileged
+	t.Run("non-infra privileged container denied", func(t *testing.T) {
+		body := `{"Image": "postgres:16", "HostConfig": {"Privileged": true}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		d := v.Validate(r)
+		if d.Allow {
+			t.Errorf("privileged non-infra container should be denied")
+		}
+	})
+}
+
+func TestValidateBuildkitContainerActions(t *testing.T) {
+	v, _ := newTestValidator()
+
+	// Persistent buildkit containers (buildx_buildkit_*) should be allowed
+	// even though they're not in the ownership tracker
+	t.Run("start buildx_buildkit_default allowed", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/containers/buildx_buildkit_default/start", "")
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("starting buildx_buildkit_default should be allowed, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("stop buildx_buildkit_default allowed", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/containers/buildx_buildkit_default/stop", "")
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("stopping buildx_buildkit_default should be allowed, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("non-infra unowned container denied", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/containers/random_container/start", "")
+		d := v.Validate(r)
+		if d.Allow {
+			t.Errorf("starting unowned non-infra container should be denied")
+		}
+	})
 }
 
 // T3: Build endpoint — all builds allowed in guarded mode, denied in read-only

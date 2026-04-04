@@ -47,12 +47,35 @@ func normalizeImage(image string) string {
 	return image
 }
 
+// imageNameOnly returns the image name without tag or digest
+// (e.g. "langfuse/langfuse:3.163.0@sha256:abc" -> "langfuse/langfuse").
+func imageNameOnly(image string) string {
+	if i := strings.IndexAny(image, ":@"); i != -1 {
+		return image[:i]
+	}
+	return image
+}
+
+// NormalizeImageName strips Docker Hub prefixes and tag/digest, returning just
+// the image name (e.g. "docker.io/moby/buildkit:v0.12" -> "moby/buildkit").
+func NormalizeImageName(image string) string {
+	return imageNameOnly(normalizeImage(image))
+}
+
 // IsImageAllowed checks if the given image is in the allowlist.
 // Comparison is normalized: "docker.io/mcp/postgres" matches "mcp/postgres".
+// An image without a tag (e.g. from a Docker pull fromImage param) matches an
+// allowlist entry that has a tag/digest, as long as the name portion matches.
 func (c *Config) IsImageAllowed(image string) bool {
 	norm := normalizeImage(image)
 	for _, allowed := range c.AllowedImages {
-		if norm == normalizeImage(allowed) {
+		normAllowed := normalizeImage(allowed)
+		if norm == normAllowed {
+			return true
+		}
+		// Allow matching by name only: a request for "langfuse/langfuse"
+		// should match allowlist entry "langfuse/langfuse:3.163.0@sha256:..."
+		if imageNameOnly(norm) == imageNameOnly(normAllowed) {
 			return true
 		}
 	}

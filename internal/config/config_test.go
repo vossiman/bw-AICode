@@ -99,8 +99,9 @@ func TestIsImageAllowed(t *testing.T) {
 	if cfg.IsImageAllowed("alpine") {
 		t.Error("alpine should NOT be allowed")
 	}
-	if cfg.IsImageAllowed("postgres:16.2") {
-		t.Error("postgres:16.2 should NOT be allowed (strict match)")
+	// Different tag still matches by name (Docker pull sends name and tag separately)
+	if !cfg.IsImageAllowed("postgres:16.2") {
+		t.Error("postgres:16.2 should be allowed (same image name)")
 	}
 }
 
@@ -118,6 +119,29 @@ func TestIsImageAllowedDockerIOPrefix(t *testing.T) {
 	// still reject unknown images
 	if cfg.IsImageAllowed("docker.io/evil/image") {
 		t.Error("docker.io/evil/image should NOT be allowed")
+	}
+}
+
+func TestIsImageAllowedTagDigestMatching(t *testing.T) {
+	// Allowlist has full tag+digest references (from docker compose config)
+	cfg := &Config{AllowedImages: []string{
+		"langfuse/langfuse:3.163.0@sha256:5162f58ca7f4861154c38debd7f5de4e77f1f6522fd32170b4fcea8db668f61b",
+		"postgres:18.3@sha256:a9abf4275f9e99bff8e6aed712b3b7dfec9cac1341bba01c1ffdfce9ff9fc34a",
+	}}
+
+	// Docker pull sends fromImage without tag — should match by name
+	if !cfg.IsImageAllowed("docker.io/langfuse/langfuse") {
+		t.Error("docker.io/langfuse/langfuse should match langfuse/langfuse:3.163.0@sha256:...")
+	}
+	if !cfg.IsImageAllowed("langfuse/langfuse") {
+		t.Error("langfuse/langfuse should match langfuse/langfuse:3.163.0@sha256:...")
+	}
+	if !cfg.IsImageAllowed("postgres") {
+		t.Error("postgres should match postgres:18.3@sha256:...")
+	}
+	// Still reject unknown images
+	if cfg.IsImageAllowed("evil/image") {
+		t.Error("evil/image should NOT be allowed")
 	}
 }
 

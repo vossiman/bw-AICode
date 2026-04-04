@@ -136,6 +136,9 @@ func (v *Validator) Validate(r *http.Request) Decision {
 	case ReImagesCreate.MatchString(path):
 		return v.validateImageCreate(r)
 
+	case ReImagesLoad.MatchString(path):
+		return v.validateImageLoad(r)
+
 	case ReBuild.MatchString(path):
 		return v.validateBuild(r)
 
@@ -155,7 +158,7 @@ func (v *Validator) Validate(r *http.Request) Decision {
 		return v.validateContainerAccess(path, ReContainerResize, "resize")
 
 	default:
-		return deny("operation not allowed")
+		return deny(fmt.Sprintf("operation not allowed: %s %s", r.Method, path))
 	}
 }
 
@@ -171,8 +174,16 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	}
 
 	// Check image allowlist
-	if !v.config.IsImageAllowed(req.Image) {
+	infraImage := !v.config.IsReadOnly() && isDockerInfraImage(req.Image)
+	if !v.config.IsImageAllowed(req.Image) && !infraImage {
 		return deny(fmt.Sprintf("image %q is not in the allowlist", req.Image))
+	}
+
+	// Docker infrastructure images (e.g. moby/buildkit) are trusted internal
+	// machinery — skip remaining security checks (privileged, volumes, etc.)
+	// since they are not user-specified containers.
+	if infraImage {
+		return allow("docker infrastructure container allowed")
 	}
 
 	// Check bind mounts (HostConfig.Binds)
@@ -269,7 +280,10 @@ func (v *Validator) validateContainerAction(path string) Decision {
 	action := matches[3]
 
 	if !v.tracker.IsOwned(containerID) {
-		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+		// Allow actions on Docker infrastructure containers (e.g. buildx_buildkit_*)
+		if v.config.IsReadOnly() || !isDockerInfraContainer(containerID) {
+			return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+		}
 	}
 
 	return allow(fmt.Sprintf("container %s allowed", action))
@@ -283,7 +297,9 @@ func (v *Validator) validateContainerDelete(path string) Decision {
 	containerID := matches[2]
 
 	if !v.tracker.IsOwned(containerID) {
-		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+		if v.config.IsReadOnly() || !isDockerInfraContainer(containerID) {
+			return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+		}
 	}
 
 	return allow("container delete allowed")
@@ -297,7 +313,9 @@ func (v *Validator) validateContainerExec(r *http.Request) Decision {
 	containerID := matches[2]
 
 	if !v.tracker.IsOwned(containerID) {
-		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+		if v.config.IsReadOnly() || !isDockerInfraContainer(containerID) {
+			return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+		}
 	}
 
 	bodyBytes, err := readBody(r)
@@ -344,6 +362,53 @@ func (v *Validator) validateBuild(r *http.Request) Decision {
 	return allow("build allowed")
 }
 
+func (v *Validator) validateImageLoad(r *http.Request) Decision {
+	if v.config.IsReadOnly() {
+		return deny("image load is not allowed in read-only mode")
+	}
+
+	// Image load is used by buildkit to import built images into Docker.
+	// Allowed in guarded mode since we already permit builds.
+	return allow("image load allowed")
+}
+
+// dockerInfraImages are images that Docker pulls internally for infrastructure
+// (e.g. buildkit for docker buildx). These are not user-specified and should be
+// allowed when builds are permitted (i.e. guarded mode, not read-only).
+var dockerInfraImages = []string{
+	"moby/buildkit",
+}
+
+// dockerInfraContainerPrefixes are name prefixes for persistent Docker
+// infrastructure containers (e.g. buildx_buildkit_*). These containers are
+// created once and reused across sessions, so the ownership tracker won't
+// know about them.
+var dockerInfraContainerPrefixes = []string{
+	"buildx_buildkit_",
+}
+
+// isDockerInfraImage checks if the image is a Docker infrastructure image.
+func isDockerInfraImage(image string) bool {
+	norm := config.NormalizeImageName(image)
+	for _, infra := range dockerInfraImages {
+		if norm == infra {
+			return true
+		}
+	}
+	return false
+}
+
+// isDockerInfraContainer checks if the container name matches a known Docker
+// infrastructure container pattern.
+func isDockerInfraContainer(nameOrID string) bool {
+	for _, prefix := range dockerInfraContainerPrefixes {
+		if strings.HasPrefix(nameOrID, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (v *Validator) validateImageCreate(r *http.Request) Decision {
 	fromImage := r.URL.Query().Get("fromImage")
 	if fromImage == "" {
@@ -351,7 +416,9 @@ func (v *Validator) validateImageCreate(r *http.Request) Decision {
 	}
 
 	if !v.config.IsImageAllowed(fromImage) {
-		return deny(fmt.Sprintf("image %q is not in the allowlist", fromImage))
+		if v.config.IsReadOnly() || !isDockerInfraImage(fromImage) {
+			return deny(fmt.Sprintf("image %q is not in the allowlist", fromImage))
+		}
 	}
 
 	return allow("image pull allowed")
@@ -385,7 +452,9 @@ func (v *Validator) validateContainerAccess(path string, re *regexp.Regexp, oper
 	containerID := matches[2]
 
 	if !v.tracker.IsOwned(containerID) {
-		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+		if v.config.IsReadOnly() || !isDockerInfraContainer(containerID) {
+			return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+		}
 	}
 
 	return allow(fmt.Sprintf("container %s allowed", operation))

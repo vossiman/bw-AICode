@@ -15,6 +15,7 @@ var (
 	ReContainerResize  = regexp.MustCompile(`^(/v[\d.]+)?/containers/([^/]+)/resize$`)
 	ReExecStart        = regexp.MustCompile(`^(/v[\d.]+)?/exec/([^/]+)/start$`)
 	ReImagesCreate     = regexp.MustCompile(`^(/v[\d.]+)?/images/create$`)
+	ReImagesLoad       = regexp.MustCompile(`^(/v[\d.]+)?/images/load$`)
 	ReBuild            = regexp.MustCompile(`^(/v[\d.]+)?/build$`)
 	ReNetworkCreate    = regexp.MustCompile(`^(/v[\d.]+)?/networks/create$`)
 )
