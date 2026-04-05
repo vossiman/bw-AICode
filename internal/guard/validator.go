@@ -142,6 +142,9 @@ func (v *Validator) Validate(r *http.Request) Decision {
 	case ReBuild.MatchString(path):
 		return v.validateBuild(r)
 
+	case r.Method == http.MethodDelete && ReNetworkDelete.MatchString(path):
+		return v.validateNetworkDelete(path)
+
 	case ReNetworkCreate.MatchString(path):
 		return v.validateNetworkCreate(r)
 
@@ -422,6 +425,20 @@ func (v *Validator) validateImageCreate(r *http.Request) Decision {
 	}
 
 	return allow("image pull allowed")
+}
+
+func (v *Validator) validateNetworkDelete(path string) Decision {
+	matches := ReNetworkDelete.FindStringSubmatch(path)
+	if matches == nil {
+		return deny("operation not allowed")
+	}
+	networkID := matches[2]
+
+	if !v.tracker.IsNetworkOwned(networkID) {
+		return deny(fmt.Sprintf("network %q is not owned by this session", networkID))
+	}
+
+	return allow("network delete allowed")
 }
 
 func (v *Validator) validateNetworkCreate(r *http.Request) Decision {

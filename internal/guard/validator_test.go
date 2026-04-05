@@ -631,6 +631,56 @@ func TestValidateNetworkCreate(t *testing.T) {
 	})
 }
 
+// DELETE network ownership check
+func TestValidateNetworkDelete(t *testing.T) {
+	v, tracker := newTestValidator()
+	tracker.AddNetwork("net123fullid")
+	tracker.AddNetwork("mynet")
+
+	t.Run("delete owned network by ID", func(t *testing.T) {
+		r := makeRequest("DELETE", "/v1.45/networks/net123fullid", "")
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("delete owned network should be allowed, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("delete owned network by name", func(t *testing.T) {
+		r := makeRequest("DELETE", "/v1.50/networks/mynet", "")
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("delete owned network by name should be allowed, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("delete unowned network", func(t *testing.T) {
+		r := makeRequest("DELETE", "/v1.45/networks/unknown999", "")
+		d := v.Validate(r)
+		if d.Allow {
+			t.Errorf("delete unowned network should be denied")
+		}
+		if !strings.Contains(strings.ToLower(d.Reason), "not owned") {
+			t.Errorf("reason should mention not owned, got: %s", d.Reason)
+		}
+	})
+
+	t.Run("delete network short ID prefix match", func(t *testing.T) {
+		r := makeRequest("DELETE", "/v1.45/networks/net123full", "")
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("delete network by short ID should be allowed, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("delete network unversioned", func(t *testing.T) {
+		r := makeRequest("DELETE", "/networks/net123fullid", "")
+		d := v.Validate(r)
+		if !d.Allow {
+			t.Errorf("unversioned delete owned network should be allowed, got deny: %s", d.Reason)
+		}
+	})
+}
+
 // Test 21: Unknown POST endpoint → deny
 func TestValidateUnknownEndpoint(t *testing.T) {
 	v, _ := newTestValidator()

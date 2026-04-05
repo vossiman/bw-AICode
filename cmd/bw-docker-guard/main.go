@@ -46,10 +46,13 @@ func main() {
 
 	tracker := ownership.New()
 
-	// Pre-populate tracker with existing compose project containers.
+	// Pre-populate tracker with existing compose project containers and networks.
 	if cfg.ComposeProject != "" {
 		if err := seedComposeContainers(tracker, *dockerSocket, cfg.ComposeProject); err != nil {
 			log.Printf("[bw-docker-guard] WARNING: failed to seed compose containers: %v", err)
+		}
+		if err := seedComposeNetworks(tracker, *dockerSocket, cfg.ComposeProject); err != nil {
+			log.Printf("[bw-docker-guard] WARNING: failed to seed compose networks: %v", err)
 		}
 	}
 
@@ -141,6 +144,54 @@ func seedComposeContainers(tracker *ownership.Tracker, dockerSocket, composeProj
 			}
 		}
 		log.Printf("[bw-docker-guard] seeded compose container: %.12s", c.ID)
+	}
+
+	return nil
+}
+
+// seedComposeNetworks queries the Docker daemon for networks belonging
+// to the given compose project and adds their IDs and names to the tracker.
+func seedComposeNetworks(tracker *ownership.Tracker, dockerSocket, composeProject string) error {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", dockerSocket)
+			},
+		},
+	}
+
+	filtersJSON, err := json.Marshal(map[string][]string{
+		"label": {fmt.Sprintf("com.docker.compose.project=%s", composeProject)},
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling filters: %w", err)
+	}
+
+	reqURL := fmt.Sprintf("http://localhost/networks?filters=%s", url.QueryEscape(string(filtersJSON)))
+	resp, err := client.Get(reqURL)
+	if err != nil {
+		return fmt.Errorf("querying Docker: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Docker returned status %d", resp.StatusCode)
+	}
+
+	var networks []struct {
+		ID   string `json:"Id"`
+		Name string `json:"Name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&networks); err != nil {
+		return fmt.Errorf("parsing response: %w", err)
+	}
+
+	for _, n := range networks {
+		tracker.AddNetwork(n.ID)
+		if n.Name != "" {
+			tracker.AddNetwork(n.Name)
+		}
+		log.Printf("[bw-docker-guard] seeded compose network: %s (%.12s)", n.Name, n.ID)
 	}
 
 	return nil

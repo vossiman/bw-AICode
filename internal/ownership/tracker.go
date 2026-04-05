@@ -5,17 +5,19 @@ import (
 	"sync"
 )
 
-// Tracker maintains a set of container IDs that this proxy "owns"
+// Tracker maintains a set of resource IDs that this proxy "owns"
 // (created through it or belonging to the compose project).
 type Tracker struct {
 	mu         sync.RWMutex
 	containers map[string]bool // full container IDs
+	networks   map[string]bool // full network IDs
 	execIDs    map[string]bool // exec instance IDs
 }
 
 func New() *Tracker {
 	return &Tracker{
 		containers: make(map[string]bool),
+		networks:   make(map[string]bool),
 		execIDs:    make(map[string]bool),
 	}
 }
@@ -57,6 +59,37 @@ func (t *Tracker) AddExecID(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.execIDs[id] = true
+}
+
+// AddNetwork tracks a network ID or name.
+func (t *Tracker) AddNetwork(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.networks[id] = true
+}
+
+// RemoveNetwork removes a network from the tracker.
+func (t *Tracker) RemoveNetwork(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.networks, id)
+}
+
+// IsNetworkOwned checks if the given ID (full or short) matches any owned network.
+func (t *Tracker) IsNetworkOwned(id string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.networks[id] {
+		return true
+	}
+
+	for full := range t.networks {
+		if strings.HasPrefix(full, id) || strings.HasPrefix(id, full) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsExecOwned checks if an exec instance was created through this proxy.

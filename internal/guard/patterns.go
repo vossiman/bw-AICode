@@ -18,4 +18,5 @@ var (
 	ReImagesLoad       = regexp.MustCompile(`^(/v[\d.]+)?/images/load$`)
 	ReBuild            = regexp.MustCompile(`^(/v[\d.]+)?/build$`)
 	ReNetworkCreate    = regexp.MustCompile(`^(/v[\d.]+)?/networks/create$`)
+	ReNetworkDelete    = regexp.MustCompile(`^(/v[\d.]+)?/networks/([^/]+)$`)
 )

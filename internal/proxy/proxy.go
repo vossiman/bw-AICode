@@ -83,6 +83,26 @@ func NewHandler(cfg *config.Config, tracker *ownership.Tracker, dockerSocketPath
 			if id != "" {
 				tracker.AddExecID(id)
 			}
+
+		case guard.ReNetworkCreate.MatchString(path):
+			id, err := extractID(resp)
+			if err != nil {
+				log.Printf("[bw-docker-guard] WARNING: failed to extract network ID from response: %v", err)
+				return nil
+			}
+			if id != "" {
+				tracker.AddNetwork(id)
+			}
+			// Also track the network name from the request body so ownership
+			// checks work when Docker CLI uses names in DELETE URLs.
+			if resp.Request.Body != nil {
+				if bodyBytes, err := io.ReadAll(resp.Request.Body); err == nil && len(bodyBytes) > 0 {
+					var nr struct{ Name string }
+					if json.Unmarshal(bodyBytes, &nr) == nil && nr.Name != "" {
+						tracker.AddNetwork(nr.Name)
+					}
+				}
+			}
 		}
 
 		return nil
