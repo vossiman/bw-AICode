@@ -585,19 +585,19 @@ parse_bw_flags() {
     esac
   done
 
+  # WSL2: Docker Desktop symlinks binaries and CLI plugins from /usr into
+  # /mnt/wsl/docker-desktop/cli-tools/... which isn't mounted by default.
+  # Bind-mount the entire cli-tools tree so docker, docker compose, buildx,
+  # and all other plugins work inside the sandbox — needed in both guarded
+  # and full-docker modes, since the guard only controls the socket, not the CLI.
+  local wsl_cli_tools="/mnt/wsl/docker-desktop/cli-tools"
+  if [[ -d "$wsl_cli_tools" ]]; then
+    COMMON_BINDS+=("ro $wsl_cli_tools")
+  fi
+
   if [[ "$BW_FULL_DOCKER" == true ]]; then
     BW_DOCKER_HOST="unix:///var/run/docker.sock"
     BW_DOCKER_MODE="full"
-
-    # WSL2: Docker Desktop symlinks binaries and CLI plugins from /usr into
-    # /mnt/wsl/docker-desktop/cli-tools/... which isn't mounted by default.
-    # Bind-mount the entire cli-tools tree so docker, docker compose, buildx,
-    # and all other plugins work inside the sandbox.
-    local wsl_cli_tools="/mnt/wsl/docker-desktop/cli-tools"
-    if [[ -d "$wsl_cli_tools" ]]; then
-      COMMON_BINDS+=("ro $wsl_cli_tools")
-    fi
-
     echo "[bw] Docker: full (unrestricted socket access)" >&2
   else
     # Derive allowlist from project config and start the guard proxy
