@@ -40,7 +40,11 @@ BINDS=(
 
 # Symlinks directly under ~/.pi/agent/ can point outside bound paths
 # (e.g. models.json -> a host-managed config repo). Bind resolved targets
-# read-only so they don't dangle inside the sandbox.
+# read-only so they don't dangle inside the sandbox — but ~/.pi is writable
+# by a sandboxed pi session, so a prior session could plant a symlink here
+# to widen a later launch's mounts. Restrict binds to regular files outside
+# HOME-root scope (not "/", not $HOME itself, not an ancestor of $HOME) so
+# this loop can't turn into a read-only mount of the whole host filesystem.
 for link in "$HOME/.pi/agent"/*; do
   [[ -L "$link" ]] || continue
   target="$(readlink -f "$link" || true)"
@@ -51,6 +55,10 @@ for link in "$HOME/.pi/agent"/*; do
   case "$target" in
     "$HOME/.pi"|"$HOME/.pi"/*|"$STARTDIR"|"$STARTDIR"/*) continue ;;
   esac
+  if [[ ! -f "$target" || "$target" == "/" || "$target" == "$HOME" || "$HOME" == "$target"/* ]]; then
+    echo "[bw] ⚠ skipping symlink target outside allowed scope: $link -> $target" >&2
+    continue
+  fi
   BINDS+=("ro $target")
 done
 
