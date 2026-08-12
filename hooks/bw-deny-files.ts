@@ -4,6 +4,7 @@
 // Mirrors hooks/bw-deny-files.sh (the Claude Code PreToolUse hook).
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export type ToolCallLike = { toolName: string; input: Record<string, unknown> };
 export type BlockResult = { block: true; reason: string } | undefined;
@@ -112,4 +113,19 @@ export function checkToolCall(event: ToolCallLike, regexes: RegExp[]): BlockResu
     if (hit) return deny(hit);
   }
   return undefined;
+}
+
+export default function (pi: ExtensionAPI) {
+  // No-op outside the sandbox (same gate as the Claude Code hook)
+  const denyFile = process.env.BW_DENY_PATTERNS_FILE;
+  if (!denyFile) return;
+  const regexes = loadPatterns(denyFile);
+  if (regexes.length === 0) return;
+
+  pi.on("tool_call", async (event) => {
+    return checkToolCall(
+      { toolName: event.toolName, input: event.input as Record<string, unknown> },
+      regexes,
+    );
+  });
 }
