@@ -18,6 +18,7 @@ Bubblewrap (`bwrap`) sandbox wrappers for AI coding tools. Runs Claude Code and 
 |---|---|
 | `claude-bw.sh` | Sandbox wrapper for Claude Code. Runs with `--dangerously-skip-permissions` (safe because bwrap enforces the sandbox). |
 | `opencode-bw.sh` | Sandbox wrapper for OpenCode. |
+| `pi-bw.sh` | Sandbox wrapper for the [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent). pi has no permission system; bwrap is the enforcement layer. |
 | `bw-common.sh` | Shared library — common bind definitions, Docker allowlist derivation, and builder function. Sourced by the wrapper scripts, not executable. |
 | `cmd/bw-docker-guard/` | Go source for the Docker API guard proxy. Built by `install.sh`. |
 | `hooks/bw-deny-files.sh` | Claude Code `PreToolUse` hook — blocks access to sensitive files inside the sandbox. |
@@ -34,6 +35,7 @@ cd bw-AICode
 This builds `bw-docker-guard`, installs the deny-files hook, and creates symlinks in `~/.local/bin/`:
 - `claude-bw` -> `claude-bw.sh`
 - `opencode-bw` -> `opencode-bw.sh`
+- `pi-bw` -> `pi-bw.sh`
 - `bw-docker-guard` (built binary)
 - `~/.claude/hooks/bw-deny-files.sh` (Claude Code hook)
 - `PreToolUse` hook registered in `~/.claude/settings.json`
@@ -48,6 +50,7 @@ Make sure `~/.local/bin` is in your `PATH`.
 cd my-project
 claude-bw          # start Claude Code sandboxed
 opencode-bw        # start OpenCode sandboxed
+pi-bw              # start pi sandboxed
 ```
 
 Run from the project directory you want to work in. Only that directory (and its subdirectories) will be writable inside the sandbox.
@@ -75,6 +78,7 @@ Pass `--full-docker` to bypass the guard proxy entirely:
 ```bash
 claude-bw --full-docker        # full Docker access inside the sandbox
 opencode-bw --full-docker      # same for OpenCode
+pi-bw --full-docker            # same for pi
 ```
 
 This mounts the raw Docker socket into the sandbox. **Warning:** this effectively gives the AI root access on the host via `docker run -v /:/host`. Only use this if you trust the AI tool completely or need Docker features that the guard proxy doesn't support.
@@ -96,6 +100,7 @@ Even inside the writable `~/local_dev` area, the sandbox blocks AI tools from re
 **How it works:**
 - **Claude Code:** A `PreToolUse` hook intercepts Read, Edit, Write, Bash, and Grep tool calls. Matches file paths (and Bash command arguments) against the deny list.
 - **OpenCode:** Permission rules are injected via `OPENCODE_PERMISSION` with per-pattern `read`/`edit` denials.
+- **pi:** A `tool_call` extension (`~/.pi/agent/extensions/bw-deny-files.ts`, installed by `install.sh`) blocks `read`/`write`/`edit` calls on denied paths and scans `bash` commands. Activates only when `BW_DENY_PATTERNS_FILE` is set (i.e. inside the sandbox).
 
 ### Per-project overrides
 
@@ -123,6 +128,7 @@ Pass `--no-deny-files` to bypass the deny list entirely:
 ```bash
 claude-bw --no-deny-files
 opencode-bw --no-deny-files
+pi-bw --no-deny-files
 ```
 
 ### Limitations

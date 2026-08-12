@@ -4,14 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repo contains two bubblewrap (`bwrap`) sandbox wrapper scripts that run AI coding tools (Claude Code, OpenCode) with restricted filesystem access. The scripts enforce that only the current directory (where you launch the wrapper) is writable; everything else is read-only or invisible.
+This repo contains three bubblewrap (`bwrap`) sandbox wrapper scripts that run AI coding tools (Claude Code, OpenCode, pi) with restricted filesystem access. The scripts enforce that only the current directory (where you launch the wrapper) is writable; everything else is read-only or invisible.
 
 ## Files
 
 - **`claude-bw`** — Sandbox wrapper for Claude Code. Runs with `--dangerously-skip-permissions` (safe because bwrap enforces the sandbox). Enables `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`.
 - **`opencode-bw`** — Sandbox wrapper for OpenCode. Pre-creates OpenCode directories before bwrap since bwrap fails on missing bind sources.
+- **`pi-bw`** — Sandbox wrapper for the pi coding agent. Binds `~/.nvm` (pi's install location) read-only and resolves symlinks under `~/.pi/agent/` to extra read-only binds (regular-file targets only, `/`, `$HOME` and its ancestors excluded).
 - **`bw-common.sh`** — Shared library: bind definitions, `build_bwrap_args()`, Docker allowlist derivation, guard proxy lifecycle, sensitive file deny patterns.
 - **`hooks/bw-deny-files.sh`** — Claude Code `PreToolUse` hook that blocks access to sensitive files. Installed to `~/.claude/hooks/` by `install.sh`.
+- **`hooks/bw-deny-files.ts`** — pi extension enforcing the same deny patterns via a `tool_call` handler. Installed to `~/.pi/agent/extensions/` by `install.sh`; unit tests run with `node --test hooks/bw-deny-files.test.ts`.
 - **`cmd/bw-docker-guard/`** — Go source for the Docker API guard proxy. Inspects and filters Docker API requests against a derived allowlist.
 
 ## Sandbox Security Model
