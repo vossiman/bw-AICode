@@ -119,8 +119,12 @@ From a scratch project dir containing a dummy `.env` and a normal file:
 
 ## Out of scope
 
-- Deny-pattern enforcement for pi's `grep`-like tools beyond the built-in
-  four (pi has no built-in grep tool).
+- pi's `grep` and `find` tools carry an optional `input.path`; when a denied
+  path is named the deny extension blocks them via the generic `input.path`
+  check. A `grep`/`find` invocation that does not name a path (searching the
+  tree by pattern) is not blocked — the same limitation the Claude hook has
+  for grep on directories. Content-scanning bash commands that never name
+  the file are likewise not caught; bwrap is the primary boundary.
 - Making the models.json symlink target writable (`pi update` writing model
   catalogs from inside the sandbox is not a supported flow).
 - Generic `~/.nvm` support in `COMMON_BINDS` (only pi-bw needs it today).

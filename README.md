@@ -100,7 +100,7 @@ Even inside the writable `~/local_dev` area, the sandbox blocks AI tools from re
 **How it works:**
 - **Claude Code:** A `PreToolUse` hook intercepts Read, Edit, Write, Bash, and Grep tool calls. Matches file paths (and Bash command arguments) against the deny list.
 - **OpenCode:** Permission rules are injected via `OPENCODE_PERMISSION` with per-pattern `read`/`edit` denials.
-- **pi:** A `tool_call` extension (`~/.pi/agent/extensions/bw-deny-files.ts`, installed by `install.sh`) blocks `read`/`write`/`edit` calls on denied paths and scans `bash` commands. Activates only when `BW_DENY_PATTERNS_FILE` is set (i.e. inside the sandbox).
+- **pi:** A `tool_call` extension (`~/.pi/agent/extensions/bw-deny-files.ts`, installed by `install.sh`) blocks `read`/`write`/`edit` calls on denied paths and scans `bash` commands. Activates only when `BW_DENY_PATTERNS_FILE` is set (i.e. inside the sandbox). pi's built-in `grep`/`find` tools are also blocked when they name a denied path.
 
 ### Per-project overrides
 
@@ -133,9 +133,10 @@ pi-bw --no-deny-files
 
 ### Limitations
 
-- **Bash bypass is partial** — common commands (`cat`, `head`, `tail`, `grep`, `sed`, etc.) and redirections (`< file`, `> file`) are caught, but exotic constructs (`python -c "open('.env').read()"`, `base64 .env`) are not. The bwrap sandbox is the primary security boundary; deny hooks are defense-in-depth.
+- **Bash bypass is partial** — common commands (`cat`, `head`, `tail`, `grep`, `sed`, etc.) and redirections (`< file`, `> file`) are caught, but exotic constructs (`python -c "open('.env').read()"`, `base64 .env`) are not. The bwrap sandbox is the primary security boundary; deny hooks are defense-in-depth. End-to-end testing confirmed a capable model can read a denied file with constructs that never name it (e.g. `find . -type f -exec cat {} \;`); treat the deny layer as defense-in-depth only.
 - **Basename matching only** — a pattern like `.env` blocks all files named `.env` anywhere in the project tree. Path-specific rules are not supported.
 - **Grep on directories** — grepping a directory that contains a denied file is not blocked (only direct grep on a denied file is caught).
+- **pi symlink binds** — `pi-bw` follows symlinks under `~/.pi/agent/` and mounts their regular-file targets read-only (to support host-managed configs like `models.json`). Because `~/.pi` is writable inside the sandbox, a compromised prior session could plant a symlink pointing at another same-user-readable file (e.g. `~/.aws/credentials`) to expose it read-only on a later launch. The deny-files extension covers common secret basenames; bwrap remains the primary boundary.
 
 ## Adding bind mounts
 

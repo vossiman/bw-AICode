@@ -40,11 +40,14 @@ BINDS=(
 
 # Symlinks directly under ~/.pi/agent/ can point outside bound paths
 # (e.g. models.json -> a host-managed config repo). Bind resolved targets
-# read-only so they don't dangle inside the sandbox — but ~/.pi is writable
-# by a sandboxed pi session, so a prior session could plant a symlink here
-# to widen a later launch's mounts. Restrict binds to regular files outside
-# HOME-root scope (not "/", not $HOME itself, not an ancestor of $HOME) so
-# this loop can't turn into a read-only mount of the whole host filesystem.
+# read-only so they don't dangle inside the sandbox. Only regular-file
+# targets are followed; /, $HOME, and $HOME's ancestors are rejected.
+# Residual risk: ~/.pi is bound read-write, so a prior sandboxed session
+# could plant a symlink here pointing at any other same-user-readable
+# regular file (e.g. ~/.aws/credentials); on a later launch that file
+# would be mounted read-only into the sandbox. bwrap remains the primary
+# boundary and the deny-files extension covers common secret basenames;
+# this is defense-in-depth, not a hard guarantee.
 for link in "$HOME/.pi/agent"/*; do
   [[ -L "$link" ]] || continue
   target="$(readlink -f "$link" || true)"
