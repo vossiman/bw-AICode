@@ -15,7 +15,7 @@ CYAN='\033[0;36m'
 RESET='\033[0m'
 
 step=0
-total=7
+total=8
 
 header() {
   echo ""
@@ -42,7 +42,7 @@ ok "$BIN_DIR"
 
 # --- Step 2: Symlink wrappers ---
 step "Installing wrappers"
-for script in claude-bw.sh opencode-bw.sh; do
+for script in claude-bw.sh opencode-bw.sh pi-bw.sh; do
   name="${script%.sh}"
   target="$SCRIPT_DIR/$script"
   link="$BIN_DIR/$name"
@@ -124,7 +124,14 @@ else
   warn "jq not found — cannot register hook in $CLAUDE_SETTINGS (add manually)"
 fi
 
-# --- Step 6: Verify PATH ---
+# --- Step 6: Install pi deny-files extension ---
+step "Installing pi deny-files extension"
+PI_EXT_DIR="$HOME/.pi/agent/extensions"
+mkdir -p "$PI_EXT_DIR"
+cp "$SCRIPT_DIR/hooks/bw-deny-files.ts" "$PI_EXT_DIR/bw-deny-files.ts"
+ok "bw-deny-files.ts copied to $PI_EXT_DIR/"
+
+# --- Step 7: Verify PATH ---
 step "Checking PATH"
 if [[ ":$PATH:" == *":$BIN_DIR:"* ]]; then
   ok "$BIN_DIR is in PATH"
@@ -132,7 +139,7 @@ else
   warn "$BIN_DIR is not in PATH — add it to your shell profile"
 fi
 
-# --- Step 7: Checking dependencies ---
+# --- Step 8: Checking dependencies ---
 step "Checking dependencies"
 
 if command -v bwrap &>/dev/null; then
@@ -151,6 +158,12 @@ if command -v opencode &>/dev/null; then
   ok "opencode found at $(command -v opencode)"
 else
   warn "opencode not found — install OpenCode before using opencode-bw"
+fi
+
+if command -v pi &>/dev/null; then
+  ok "pi found at $(command -v pi)"
+else
+  warn "pi not found — install pi before using pi-bw"
 fi
 
 if command -v docker &>/dev/null; then
@@ -172,5 +185,5 @@ else
 fi
 
 echo ""
-echo -e "  ${GREEN}${BOLD}Done.${RESET} Run ${CYAN}claude-bw${RESET} or ${CYAN}opencode-bw${RESET} from your project directory"
+echo -e "  ${GREEN}${BOLD}Done.${RESET} Run ${CYAN}claude-bw${RESET}, ${CYAN}opencode-bw${RESET} or ${CYAN}pi-bw${RESET} from your project directory"
 echo ""
