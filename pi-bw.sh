@@ -38,32 +38,26 @@ BINDS=(
   "rw! $HOME/.pi"
 )
 
-# Symlinks directly under ~/.pi/agent/ can point outside bound paths
-# (e.g. models.json -> a host-managed config repo). Bind resolved targets
-# read-only so they don't dangle inside the sandbox. Only regular-file
-# targets are followed; /, $HOME, and $HOME's ancestors are rejected.
+# Symlinks under ~/.pi/agent/ (up to 3 levels deep: agent/<dir>/<subdir>/<file>)
+# can point outside bound paths — e.g. models.json, agents/*.md,
+# extensions/**/*.ts symlinked from a host-managed config repo. Bind resolved
+# targets read-only so they don't dangle inside the sandbox. Only regular-file
+# targets are followed; /, $HOME, and $HOME's ancestors are rejected, and
+# duplicate targets are bound once (see resolve_symlink_binds in bw-common.sh).
 # Residual risk: ~/.pi is bound read-write, so a prior sandboxed session
 # could plant a symlink here pointing at any other same-user-readable
 # regular file (e.g. ~/.aws/credentials); on a later launch that file
-# would be mounted read-only into the sandbox. bwrap remains the primary
-# boundary and the deny-files extension covers common secret basenames;
-# this is defense-in-depth, not a hard guarantee.
-for link in "$HOME/.pi/agent"/*; do
-  [[ -L "$link" ]] || continue
-  target="$(readlink -f "$link" || true)"
-  if [[ -z "$target" || ! -e "$target" ]]; then
-    echo "[bw] ⚠ skipping dangling symlink: $link" >&2
-    continue
-  fi
-  case "$target" in
-    "$HOME/.pi"|"$HOME/.pi"/*|"$STARTDIR"|"$STARTDIR"/*) continue ;;
-  esac
-  if [[ ! -f "$target" || "$target" == "/" || "$target" == "$HOME" || "$HOME" == "$target"/* ]]; then
-    echo "[bw] ⚠ skipping symlink target outside allowed scope: $link -> $target" >&2
-    continue
-  fi
-  BINDS+=("ro $target")
-done
+# would be mounted read-only into the sandbox. Recursing WIDENS that
+# surface: a planted link no longer has to sit at the top level of
+# ~/.pi/agent/ where it would be conspicuous — it can hide three levels
+# deep in an extensions/ subdirectory. The deny-files extension only
+# pattern-matches common secret basenames on pi's tool calls (best-effort,
+# bypassable, and blind to files with unremarkable names), so it does NOT
+# close this hole. bwrap remains the primary boundary; this bind pass is
+# a convenience for host-managed config, not a hard guarantee — audit
+# ~/.pi/agent/ symlinks if the sandbox may have run untrusted output.
+PI_SYMLINK_TARGETS=()
+resolve_symlink_binds PI_SYMLINK_TARGETS "$HOME/.pi/agent" "$HOME/.pi"
 
 # Overlay binds — placed after --tmpfs /tmp and --tmpfs /run
 OVERLAY_BINDS=(
@@ -79,6 +73,13 @@ fi
 
 build_bwrap_args BINDS BWRAP_ARGS
 build_bwrap_args OVERLAY_BINDS BWRAP_OVERLAY_ARGS
+
+# Symlink targets are appended as explicit --ro-bind args (not BINDS entries):
+# the "mode source [dest]" string format splits on whitespace, so paths with
+# spaces would be mangled by build_bwrap_args.
+for target in "${PI_SYMLINK_TARGETS[@]}"; do
+  BWRAP_ARGS+=(--ro-bind "$target" "$target")
+done
 
 BWRAP_CMD=(
   bwrap

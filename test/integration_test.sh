@@ -21,8 +21,130 @@ fail() { echo -e "  ${RED}FAIL${RESET} $1: $2"; fail=$((fail + 1)); }
 skip() { echo -e "  ${YELLOW}SKIP${RESET} $1: $2"; skip=$((skip + 1)); }
 
 # --- Setup ---
-echo "=== bw-docker-guard integration tests ==="
+echo "=== bw-AICode integration tests ==="
 echo ""
+
+# ============================================================
+# Test 0: pi-bw symlink bind resolution (no Docker needed)
+# ============================================================
+echo "--- pi-bw symlink bind resolution ---"
+
+SYMLINK_TEST_HOME="$(mktemp -d /tmp/bw-symlink-test-XXXXXX)"
+
+# Fake config repo (with a space in the path) and fake ~/.pi/agent tree
+sym_repo="$SYMLINK_TEST_HOME/config repo"
+sym_agent="$SYMLINK_TEST_HOME/.pi/agent"
+mkdir -p "$sym_repo/agents" "$sym_repo/extensions/nested" \
+         "$sym_agent/agents" "$sym_agent/extensions/sub" "$sym_agent/prompts" \
+         "$SYMLINK_TEST_HOME/project" "$SYMLINK_TEST_HOME/.aws"
+echo agent > "$sym_repo/agents/reviewer.md"
+echo ext   > "$sym_repo/extensions/deny.ts"
+echo nest  > "$sym_repo/extensions/nested/helper.ts"
+echo model > "$sym_repo/models.json"
+echo proj  > "$SYMLINK_TEST_HOME/project/inproject.txt"
+echo pi    > "$SYMLINK_TEST_HOME/.pi/internal.txt"
+echo cred  > "$SYMLINK_TEST_HOME/.aws/credentials"
+
+ln -s "$sym_repo/models.json"                "$sym_agent/models.json"           # depth 1 (existing behavior)
+ln -s "$sym_repo/agents/reviewer.md"         "$sym_agent/agents/reviewer.md"    # depth 2
+ln -s "$sym_repo/extensions/deny.ts"         "$sym_agent/extensions/deny.ts"    # depth 2
+ln -s "$sym_repo/extensions/nested/helper.ts" "$sym_agent/extensions/sub/helper.ts"  # depth 3
+ln -s "$sym_repo/agents/reviewer.md"         "$sym_agent/prompts/dup.md"        # duplicate target
+ln -s "$SYMLINK_TEST_HOME/missing.txt"       "$sym_agent/agents/dangling.md"    # dangling
+ln -s "$SYMLINK_TEST_HOME/.aws"              "$sym_agent/agents/awsdir"         # directory target -> rejected
+ln -s "$SYMLINK_TEST_HOME/project/inproject.txt" "$sym_agent/agents/inproject.md"  # under STARTDIR -> skipped
+ln -s "$SYMLINK_TEST_HOME/.pi/internal.txt"  "$sym_agent/agents/internal.md"    # under bound root -> skipped
+
+# Run the resolution in a fresh bash process (separate process so set -e
+# inside it is not suppressed by the || context) with HOME overridden.
+sym_driver="$SYMLINK_TEST_HOME/driver.sh"
+cat > "$sym_driver" <<'EOF'
+set -euo pipefail
+cd "$HOME/project"
+source "$BW_COMMON"
+TARGETS=()
+resolve_symlink_binds TARGETS "$HOME/.pi/agent" "$HOME/.pi"
+if (( ${#TARGETS[@]} > 0 )); then
+  printf '%s\n' "${TARGETS[@]}"
+fi
+EOF
+
+sym_targets="$SYMLINK_TEST_HOME/targets.txt"
+sym_warns="$SYMLINK_TEST_HOME/warnings.txt"
+sym_rc=0
+HOME="$SYMLINK_TEST_HOME" BW_COMMON="$PROJECT_DIR/bw-common.sh" \
+  bash "$sym_driver" > "$sym_targets" 2> "$sym_warns" || sym_rc=$?
+
+has_target() { grep -qxF "$1" "$sym_targets"; }
+
+if [[ $sym_rc -eq 0 ]]; then
+  ok "symlinks: resolution runs cleanly"
+else
+  fail "symlinks: resolution" "exit code $sym_rc: $(cat "$sym_warns")"
+fi
+
+if has_target "$sym_repo/models.json"; then
+  ok "symlinks: depth-1 target bound (models.json)"
+else
+  fail "symlinks: depth-1 target" "missing $sym_repo/models.json"
+fi
+
+if has_target "$sym_repo/agents/reviewer.md"; then
+  ok "symlinks: depth-2 target bound (agents/reviewer.md)"
+else
+  fail "symlinks: depth-2 target" "missing $sym_repo/agents/reviewer.md"
+fi
+
+if has_target "$sym_repo/extensions/deny.ts"; then
+  ok "symlinks: depth-2 target bound (extensions/deny.ts)"
+else
+  fail "symlinks: depth-2 target" "missing $sym_repo/extensions/deny.ts"
+fi
+
+if has_target "$sym_repo/extensions/nested/helper.ts"; then
+  ok "symlinks: depth-3 target bound, path with space"
+else
+  fail "symlinks: depth-3 target" "missing $sym_repo/extensions/nested/helper.ts"
+fi
+
+dup_count="$(grep -cxF "$sym_repo/agents/reviewer.md" "$sym_targets" || true)"
+if [[ "$dup_count" == "1" ]]; then
+  ok "symlinks: duplicate targets deduplicated"
+else
+  fail "symlinks: dedup" "expected 1 entry for reviewer.md, got $dup_count"
+fi
+
+if ! has_target "$SYMLINK_TEST_HOME/missing.txt" && grep -q "dangling" "$sym_warns"; then
+  ok "symlinks: dangling link skipped with warning"
+else
+  fail "symlinks: dangling link" "should be skipped with a warning"
+fi
+
+if ! has_target "$SYMLINK_TEST_HOME/.aws" && grep -q "outside allowed scope.*\.aws" "$sym_warns"; then
+  ok "symlinks: directory target (.aws) rejected with warning"
+else
+  fail "symlinks: directory target" "should be rejected with a warning"
+fi
+
+if ! has_target "$SYMLINK_TEST_HOME/project/inproject.txt"; then
+  ok "symlinks: target under STARTDIR skipped"
+else
+  fail "symlinks: STARTDIR target" "should be skipped (already bound rw)"
+fi
+
+if ! has_target "$SYMLINK_TEST_HOME/.pi/internal.txt"; then
+  ok "symlinks: target under bound root (~/.pi) skipped"
+else
+  fail "symlinks: bound-root target" "should be skipped (already bound rw)"
+fi
+
+rm -rf "$SYMLINK_TEST_HOME"
+
+# ============================================================
+# bw-docker-guard integration tests
+# ============================================================
+echo ""
+echo "--- bw-docker-guard setup ---"
 
 # Build the binary
 echo "Building bw-docker-guard..."
@@ -33,7 +155,10 @@ echo ""
 
 # Check Docker is available
 if ! docker info &>/dev/null; then
-  echo "Docker is not available — skipping integration tests"
+  echo "Docker is not available — skipping Docker integration tests"
+  echo ""
+  echo "=== Results: ${pass} passed, ${fail} failed, ${skip} skipped ==="
+  (( fail > 0 )) && exit 1
   exit 0
 fi
 

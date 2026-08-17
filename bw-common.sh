@@ -106,6 +106,49 @@ build_bwrap_args() {
   done
 }
 
+# --- Symlink target resolution ---
+# Recursively scans scan_root (bounded depth, default 3) for symlinks and
+# appends their resolved targets to the named output array, so callers can
+# bind them read-only and host-managed config symlinked into a rw-bound tree
+# still resolves inside the sandbox. Handles spaces in paths (find -print0).
+# Per-target rules (unchanged from the original pi-bw top-level loop):
+#   - dangling links are skipped with a warning
+#   - targets already under bound_root or $STARTDIR are skipped silently
+#     (already mounted; re-binding could shadow a rw bind with ro)
+#   - only regular-file targets are followed; /, $HOME, and $HOME's
+#     ancestors are rejected with a warning
+# Identical targets are deduplicated (sibling symlinks often share a repo).
+# Directory symlinks inside scan_root are NOT descended into (plain find,
+# not -L): following them could walk arbitrary host trees and defeat the
+# depth bound.
+# Usage: resolve_symlink_binds OUT_ARRAY scan_root bound_root [max_depth]
+resolve_symlink_binds() {
+  local -n _rsb_out=$1
+  local scan_root="$2"
+  local bound_root="$3"
+  local max_depth="${4:-3}"
+  local -A _rsb_seen=()
+  local link target
+  [[ -d "$scan_root" ]] || return 0
+  while IFS= read -r -d '' link; do
+    target="$(readlink -f "$link" || true)"
+    if [[ -z "$target" || ! -e "$target" ]]; then
+      echo "[bw] ⚠ skipping dangling symlink: $link" >&2
+      continue
+    fi
+    case "$target" in
+      "$bound_root"|"$bound_root"/*|"$STARTDIR"|"$STARTDIR"/*) continue ;;
+    esac
+    if [[ ! -f "$target" || "$target" == "/" || "$target" == "$HOME" || "$HOME" == "$target"/* ]]; then
+      echo "[bw] ⚠ skipping symlink target outside allowed scope: $link -> $target" >&2
+      continue
+    fi
+    [[ -n "${_rsb_seen[$target]:-}" ]] && continue
+    _rsb_seen["$target"]=1
+    _rsb_out+=("$target")
+  done < <(find "$scan_root" -mindepth 1 -maxdepth "$max_depth" -type l -print0)
+}
+
 # --- Docker allowlist derivation ---
 # Scans the project directory for Docker Compose files and Docker-based MCP
 # server configs. Produces a JSON allowlist for bw-docker-guard.
