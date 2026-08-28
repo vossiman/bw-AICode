@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Type stripping for hooks/bw-deny-files.ts, so node --test can import
+      # the extension directly rather than through a build step.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Syntax-check shell sources
+        run: bash -n install.sh bw-common.sh claude-bw.sh opencode-bw.sh pi-bw.sh hooks/bw-deny-files.sh test/install_hooks_test.sh test/integration_test.sh
+
+      - name: Go tests
+        run: go test ./...
+
+      - name: pi extension tests
+        run: node --test hooks/bw-deny-files.test.ts
+
+      # Guards the deny-hook ownership rules in install.sh steps 4 and 6.
+      # Overwriting aiCodingBaseSetup's hardened hook silently downgrades an
+      # always-on secrets guard to a sandbox-only one, which is invisible in
+      # the installer's output — so it has to be a machine check.
+      - name: Installer hook ownership
+        run: test/install_hooks_test.sh

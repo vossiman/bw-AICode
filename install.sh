@@ -80,8 +80,9 @@ fi
 
 # --- Step 4: Install deny-files hook ---
 #
-# Only when absent. The hook here is sandbox-scoped: it returns early unless
-# BW_DENY_PATTERNS_FILE is set, so it does nothing outside a bw sandbox.
+# Only over copies this installer owns. The hook here is sandbox-scoped: it
+# returns early unless BW_DENY_PATTERNS_FILE is set, so it does nothing
+# outside a bw sandbox.
 # aiCodingBaseSetup ships a hardened superset at this same path that enforces
 # a built-in deny list ALWAYS and treats BW_DENY_PATTERNS_FILE as additional
 # patterns. Overwriting that silently downgrades an always-on secrets guard to

@@ -2,10 +2,20 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export GOCACHE="${GOCACHE:-$(go env GOCACHE)}"
-export GOMODCACHE="${GOMODCACHE:-$(go env GOMODCACHE)}"
+
+# install.sh builds bw-docker-guard, and Go defaults both caches under $HOME.
+# Without these, the build writes a read-only module cache into TEST_HOME that
+# the cleanup below cannot remove — which fails the run after the assertions
+# have already passed. Go is optional here: the step only warns when absent,
+# and hook ownership does not depend on it.
+if command -v go &>/dev/null; then
+  export GOCACHE="${GOCACHE:-$(go env GOCACHE)}"
+  export GOMODCACHE="${GOMODCACHE:-$(go env GOMODCACHE)}"
+fi
+
 TEST_HOME="$(mktemp -d)"
-trap 'rm -rf "$TEST_HOME"' EXIT
+cleanup() { chmod -R u+w "$TEST_HOME" 2>/dev/null || true; rm -rf "$TEST_HOME"; }
+trap cleanup EXIT
 
 run_install() {
   HOME="$TEST_HOME" bash "$ROOT/install.sh" >/dev/null
