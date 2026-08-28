@@ -79,12 +79,29 @@ else
 fi
 
 # --- Step 4: Install deny-files hook ---
+#
+# Only when absent. The hook here is sandbox-scoped: it returns early unless
+# BW_DENY_PATTERNS_FILE is set, so it does nothing outside a bw sandbox.
+# aiCodingBaseSetup ships a hardened superset at this same path that enforces
+# a built-in deny list ALWAYS and treats BW_DENY_PATTERNS_FILE as additional
+# patterns. Overwriting that silently downgrades an always-on secrets guard to
+# a sandbox-only one, and the file looks identical from the outside — which is
+# exactly how it went unnoticed from 2026-08-24 to 2026-08-28, one silent
+# downgrade per provisioning run.
+#
+# So: whoever got here first keeps the path. On a machine with aicoding its
+# managed deploy runs before this installer and wins; standalone, this still
+# installs the sandbox hook because nothing else provides one.
 step "Installing deny-files hook"
 HOOKS_DIR="$HOME/.claude/hooks"
 mkdir -p "$HOOKS_DIR"
-cp "$SCRIPT_DIR/hooks/bw-deny-files.sh" "$HOOKS_DIR/bw-deny-files.sh"
-chmod +x "$HOOKS_DIR/bw-deny-files.sh"
-ok "bw-deny-files.sh copied to $HOOKS_DIR/"
+if [[ -e "$HOOKS_DIR/bw-deny-files.sh" ]]; then
+  ok "bw-deny-files.sh already present — left as is (not overwriting)"
+else
+  cp "$SCRIPT_DIR/hooks/bw-deny-files.sh" "$HOOKS_DIR/bw-deny-files.sh"
+  chmod +x "$HOOKS_DIR/bw-deny-files.sh"
+  ok "bw-deny-files.sh copied to $HOOKS_DIR/"
+fi
 
 # --- Step 5: Register PreToolUse hook in Claude settings ---
 step "Registering Claude Code hook"
@@ -125,11 +142,18 @@ else
 fi
 
 # --- Step 6: Install pi deny-files extension ---
+#
+# Only when absent, for the same reason as step 4 — this extension carries the
+# same sandbox gate, and aiCodingBaseSetup ships an always-on replacement.
 step "Installing pi deny-files extension"
 PI_EXT_DIR="$HOME/.pi/agent/extensions"
 mkdir -p "$PI_EXT_DIR"
-cp "$SCRIPT_DIR/hooks/bw-deny-files.ts" "$PI_EXT_DIR/bw-deny-files.ts"
-ok "bw-deny-files.ts copied to $PI_EXT_DIR/"
+if [[ -e "$PI_EXT_DIR/bw-deny-files.ts" ]]; then
+  ok "bw-deny-files.ts already present — left as is (not overwriting)"
+else
+  cp "$SCRIPT_DIR/hooks/bw-deny-files.ts" "$PI_EXT_DIR/bw-deny-files.ts"
+  ok "bw-deny-files.ts copied to $PI_EXT_DIR/"
+fi
 
 # --- Step 7: Verify PATH ---
 step "Checking PATH"
