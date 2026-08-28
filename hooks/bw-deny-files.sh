@@ -1,5 +1,6 @@
 #!/bin/bash
 # bw-deny-files.sh — Claude Code PreToolUse hook that blocks access to sensitive files.
+# Managed by bw-AICode install.sh; safe to replace on upgrade.
 # Installed globally but only activates when BW_DENY_PATTERNS_FILE is set (inside sandbox).
 # Receives JSON on stdin from Claude Code with tool_name and tool_input.
 

@@ -89,18 +89,28 @@ fi
 # exactly how it went unnoticed from 2026-08-24 to 2026-08-28, one silent
 # downgrade per provisioning run.
 #
-# So: whoever got here first keeps the path. On a machine with aicoding its
-# managed deploy runs before this installer and wins; standalone, this still
-# installs the sandbox hook because nothing else provides one.
+# Files carrying bw-AICode's ownership marker are refreshed on upgrade. The
+# legacy marker adopts copies installed before that marker existed. Anything
+# else is left alone, so aiCodingBaseSetup's hardened hook and user-owned hooks
+# still win without freezing standalone bw-AICode installations forever.
 step "Installing deny-files hook"
 HOOKS_DIR="$HOME/.claude/hooks"
 mkdir -p "$HOOKS_DIR"
+hook_action="copied"
 if [[ -e "$HOOKS_DIR/bw-deny-files.sh" ]]; then
-  ok "bw-deny-files.sh already present — left as is (not overwriting)"
-else
+  if grep -qF "Managed by bw-AICode install.sh" "$HOOKS_DIR/bw-deny-files.sh" \
+    || grep -qF "Installed globally but only activates when BW_DENY_PATTERNS_FILE is set" "$HOOKS_DIR/bw-deny-files.sh"; then
+    hook_action="updated"
+  else
+    hook_action=""
+  fi
+fi
+if [[ -n "$hook_action" ]]; then
   cp "$SCRIPT_DIR/hooks/bw-deny-files.sh" "$HOOKS_DIR/bw-deny-files.sh"
   chmod +x "$HOOKS_DIR/bw-deny-files.sh"
-  ok "bw-deny-files.sh copied to $HOOKS_DIR/"
+  ok "bw-deny-files.sh $hook_action in $HOOKS_DIR/"
+else
+  ok "bw-deny-files.sh already present — left as is (not overwriting)"
 fi
 
 # --- Step 5: Register PreToolUse hook in Claude settings ---
@@ -143,16 +153,25 @@ fi
 
 # --- Step 6: Install pi deny-files extension ---
 #
-# Only when absent, for the same reason as step 4 — this extension carries the
-# same sandbox gate, and aiCodingBaseSetup ships an always-on replacement.
+# Same ownership rule as step 4: refresh ours, adopt the pre-marker legacy
+# copy, and preserve aiCodingBaseSetup's or a user's implementation.
 step "Installing pi deny-files extension"
 PI_EXT_DIR="$HOME/.pi/agent/extensions"
 mkdir -p "$PI_EXT_DIR"
+extension_action="copied"
 if [[ -e "$PI_EXT_DIR/bw-deny-files.ts" ]]; then
-  ok "bw-deny-files.ts already present — left as is (not overwriting)"
-else
+  if grep -qF "Managed by bw-AICode install.sh" "$PI_EXT_DIR/bw-deny-files.ts" \
+    || grep -qF "Mirrors hooks/bw-deny-files.sh" "$PI_EXT_DIR/bw-deny-files.ts"; then
+    extension_action="updated"
+  else
+    extension_action=""
+  fi
+fi
+if [[ -n "$extension_action" ]]; then
   cp "$SCRIPT_DIR/hooks/bw-deny-files.ts" "$PI_EXT_DIR/bw-deny-files.ts"
-  ok "bw-deny-files.ts copied to $PI_EXT_DIR/"
+  ok "bw-deny-files.ts $extension_action in $PI_EXT_DIR/"
+else
+  ok "bw-deny-files.ts already present — left as is (not overwriting)"
 fi
 
 # --- Step 7: Verify PATH ---

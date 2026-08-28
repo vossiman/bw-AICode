@@ -1,4 +1,5 @@
 // bw-deny-files.ts — pi extension that blocks access to sensitive files.
+// Managed by bw-AICode install.sh; safe to replace on upgrade.
 // Installed globally to ~/.pi/agent/extensions/ but only activates when
 // BW_DENY_PATTERNS_FILE is set (inside the bw-AICode sandbox).
 // Mirrors hooks/bw-deny-files.sh (the Claude Code PreToolUse hook).
