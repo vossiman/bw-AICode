@@ -186,7 +186,7 @@ var hostConfigKnownKeys = map[string]bool{
 	// --- checked by value in validateContainerCreate ---
 	"Binds":             true, // host paths, checked against the volume allowlist
 	"Mounts":            true, // default-deny on mount Type; bind sources checked
-	"Privileged":        true, // denied except for a digest-pinned infra image
+	"Privileged":        true, // denied unconditionally, for every image
 	"PidMode":           true, // host/container: forms denied
 	"NetworkMode":       true, // host/container: forms denied
 	"UsernsMode":        true, // host denied
