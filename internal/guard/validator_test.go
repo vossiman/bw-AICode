@@ -636,32 +636,52 @@ func TestValidateContainerCreateInfraDigestOnly(t *testing.T) {
 	})
 }
 
-func TestValidateBuildkitContainerActions(t *testing.T) {
-	v, _ := newTestValidator()
+// Was TestValidateBuildkitContainerActions, which asserted that any
+// container whose NAME starts with buildx_buildkit_ may be started and
+// stopped without ownership. Inverted: only host-seeded containers are.
+func TestBuildkitPrefixGrantsNothing(t *testing.T) {
+	cfg := &config.Config{
+		ProjectDir:         "/project",
+		AllowedImages:      []string{"postgres:16"},
+		VolumeMountRoot:    "/project",
+		PreownedContainers: []string{"buildx_buildkit_default"},
+	}
+	tracker := ownership.New()
+	tracker.Seed(cfg.PreownedContainers)
+	v := NewValidator(cfg, tracker)
 
-	// Persistent buildkit containers (buildx_buildkit_*) should be allowed
-	// even though they're not in the ownership tracker
-	t.Run("start buildx_buildkit_default allowed", func(t *testing.T) {
+	t.Run("seeded buildkit container may be started", func(t *testing.T) {
 		r := makeRequest("POST", "/v1.45/containers/buildx_buildkit_default/start", "")
-		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("starting buildx_buildkit_default should be allowed, got deny: %s", d.Reason)
+		if d := v.Validate(r); !d.Allow {
+			t.Errorf("a host-seeded container should be actionable, got deny: %s", d.Reason)
 		}
 	})
 
-	t.Run("stop buildx_buildkit_default allowed", func(t *testing.T) {
-		r := makeRequest("POST", "/v1.45/containers/buildx_buildkit_default/stop", "")
-		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("stopping buildx_buildkit_default should be allowed, got deny: %s", d.Reason)
+	t.Run("unseeded container with the magic prefix is denied", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/containers/buildx_buildkit_evil/start", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: the buildx_buildkit_ prefix must not grant ownership")
 		}
 	})
 
-	t.Run("non-infra unowned container denied", func(t *testing.T) {
+	t.Run("unseeded prefix container cannot be exec'd", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/containers/buildx_buildkit_evil/exec", `{}`)
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: prefix must not grant exec")
+		}
+	})
+
+	t.Run("unseeded prefix container cannot be deleted", func(t *testing.T) {
+		r := makeRequest("DELETE", "/v1.45/containers/buildx_buildkit_evil", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: prefix must not grant delete")
+		}
+	})
+
+	t.Run("ordinary unowned container still denied", func(t *testing.T) {
 		r := makeRequest("POST", "/v1.45/containers/random_container/start", "")
-		d := v.Validate(r)
-		if d.Allow {
-			t.Errorf("starting unowned non-infra container should be denied")
+		if d := v.Validate(r); d.Allow {
+			t.Error("starting an unowned container should be denied")
 		}
 	})
 }

@@ -109,3 +109,18 @@ func TestTrackerEmptyNotOwned(t *testing.T) {
 		t.Error("empty tracker should not own any exec")
 	}
 }
+
+func TestSeedMarksContainersOwned(t *testing.T) {
+	tr := New()
+	tr.Seed([]string{"buildx_buildkit_default", "abc123"})
+
+	if !tr.IsOwned("buildx_buildkit_default") {
+		t.Error("a seeded container should be owned")
+	}
+	if !tr.IsOwned("abc123") {
+		t.Error("a seeded container ID should be owned")
+	}
+	if tr.IsOwned("buildx_buildkit_evil") {
+		t.Error("a container that was not seeded must not be owned")
+	}
+}

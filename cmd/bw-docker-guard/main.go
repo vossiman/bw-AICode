@@ -45,6 +45,7 @@ func main() {
 	}
 
 	tracker := ownership.New()
+	tracker.Seed(cfg.PreownedContainers)
 
 	// Pre-populate tracker with existing compose project containers and networks.
 	if cfg.ComposeProject != "" {

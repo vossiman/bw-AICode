@@ -28,6 +28,15 @@ func (t *Tracker) Add(id string) {
 	t.containers[id] = true
 }
 
+// Seed marks containers as owned without them having been created through
+// this session. Used for persistent Docker infrastructure containers whose
+// IDs are resolved host-side at startup, never from caller-supplied names.
+func (t *Tracker) Seed(ids []string) {
+	for _, id := range ids {
+		t.Add(id)
+	}
+}
+
 func (t *Tracker) Remove(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

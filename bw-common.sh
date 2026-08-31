@@ -336,6 +336,28 @@ derive_docker_allowlist() {
     volume_paths_json="[]"
   fi
 
+  # --- Host-resolved infrastructure facts ---
+  # Both are derived from the local Docker daemon, never from project input.
+  # A digest names content, so it cannot be minted; a container ID list is
+  # a snapshot of what already exists on this host.
+  local infra_digests_json="[]" preowned_json="[]"
+  if command -v docker &>/dev/null; then
+    local buildkit_digests
+    buildkit_digests="$(docker image inspect \
+      --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+      moby/buildkit 2>/dev/null | sed -n 's/.*@//p' | sort -u)"
+    if [[ -n "$buildkit_digests" ]]; then
+      infra_digests_json="$(printf '%s\n' "$buildkit_digests" | jq -R . | jq -s 'map(select(. != ""))')"
+    fi
+
+    local preowned
+    preowned="$(docker ps -a --filter 'name=^buildx_buildkit_' \
+      --format '{{.Names}}' 2>/dev/null | sort -u)"
+    if [[ -n "$preowned" ]]; then
+      preowned_json="$(printf '%s\n' "$preowned" | jq -R . | jq -s 'map(select(. != ""))')"
+    fi
+  fi
+
   jq -n \
     --arg project_dir "$STARTDIR" \
     --arg compose_project "$compose_project" \
@@ -343,13 +365,17 @@ derive_docker_allowlist() {
     --argjson networks "$networks_json" \
     --arg volume_mount_root "$STARTDIR" \
     --argjson volume_paths "$volume_paths_json" \
+    --argjson infra_digests "$infra_digests_json" \
+    --argjson preowned "$preowned_json" \
     '{
       project_dir: $project_dir,
       compose_project: $compose_project,
       allowed_images: $images,
       allowed_networks: $networks,
       volume_mount_root: $volume_mount_root,
-      allowed_volume_paths: $volume_paths
+      allowed_volume_paths: $volume_paths,
+      infra_image_digests: $infra_digests,
+      preowned_containers: $preowned
     }' > "$BW_DOCKER_GUARD_CONFIG"
 }
 

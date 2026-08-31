@@ -45,6 +45,10 @@ type Config struct {
 	// bw-common.sh, never from project-controlled input. A digest names
 	// content, so unlike a name it cannot be minted by the caller.
 	InfraImageDigests []string `json:"infra_image_digests"`
+	// PreownedContainers are IDs/names of persistent Docker infrastructure
+	// containers, resolved host-side by bw-common.sh. Seeded into the
+	// ownership tracker at startup.
+	PreownedContainers []string `json:"preowned_containers"`
 }
 
 // IsReadOnly returns true if no images are allowed (read-only mode).

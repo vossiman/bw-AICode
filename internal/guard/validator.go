@@ -315,10 +315,7 @@ func (v *Validator) validateContainerAction(path string) Decision {
 	action := matches[3]
 
 	if !v.tracker.IsOwned(containerID) {
-		// Allow actions on Docker infrastructure containers (e.g. buildx_buildkit_*)
-		if v.config.IsReadOnly() || !isDockerInfraContainer(containerID) {
-			return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
-		}
+		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
 	}
 
 	return allow(fmt.Sprintf("container %s allowed", action))
@@ -332,9 +329,7 @@ func (v *Validator) validateContainerDelete(path string) Decision {
 	containerID := matches[2]
 
 	if !v.tracker.IsOwned(containerID) {
-		if v.config.IsReadOnly() || !isDockerInfraContainer(containerID) {
-			return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
-		}
+		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
 	}
 
 	return allow("container delete allowed")
@@ -348,9 +343,7 @@ func (v *Validator) validateContainerExec(r *http.Request) Decision {
 	containerID := matches[2]
 
 	if !v.tracker.IsOwned(containerID) {
-		if v.config.IsReadOnly() || !isDockerInfraContainer(containerID) {
-			return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
-		}
+		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
 	}
 
 	bodyBytes, err := readBody(r)
@@ -415,25 +408,6 @@ func (v *Validator) validateImageLoad(r *http.Request) Decision {
 	return deny("image load is not allowed: a tar's tags cannot be checked against the allowlist")
 }
 
-// dockerInfraContainerPrefixes are name prefixes for persistent Docker
-// infrastructure containers (e.g. buildx_buildkit_*). These containers are
-// created once and reused across sessions, so the ownership tracker won't
-// know about them.
-var dockerInfraContainerPrefixes = []string{
-	"buildx_buildkit_",
-}
-
-// isDockerInfraContainer checks if the container name matches a known Docker
-// infrastructure container pattern.
-func isDockerInfraContainer(nameOrID string) bool {
-	for _, prefix := range dockerInfraContainerPrefixes {
-		if strings.HasPrefix(nameOrID, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
 func (v *Validator) validateImageCreate(r *http.Request) Decision {
 	fromImage := r.URL.Query().Get("fromImage")
 	if fromImage == "" {
@@ -490,9 +464,7 @@ func (v *Validator) validateContainerAccess(path string, re *regexp.Regexp, oper
 	containerID := matches[2]
 
 	if !v.tracker.IsOwned(containerID) {
-		if v.config.IsReadOnly() || !isDockerInfraContainer(containerID) {
-			return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
-		}
+		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
 	}
 
 	return allow(fmt.Sprintf("container %s allowed", operation))
