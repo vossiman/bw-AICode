@@ -479,9 +479,16 @@ func (v *Validator) validateNetworkCreate(r *http.Request) Decision {
 // are allowed wholesale. Anything not listed is denied by default.
 //
 // They are not free: each one discloses host-wide *names* — of containers,
-// images and networks belonging to other projects. That residual is accepted
-// because the CLI cannot work without them, and closing it needs
+// images, networks and volumes belonging to other projects. That residual is
+// accepted because the CLI cannot work without them, and closing it needs
 // ownership-filtered response bodies rather than a route decision.
+//
+// Volume names in particular are visible three separate ways: /volumes,
+// /system/df (its Volumes[] carries Name and Mountpoint for every volume on
+// the host) and /containers/json (its Mounts[].Name). /containers/json is
+// what `docker ps` runs on and cannot be removed, so dropping the other two
+// hides nothing from anyone. Removing routes is not the lever here; response
+// filtering is. Do not re-derive a mitigation from this list.
 var globalReadPaths = map[string]bool{
 	"/_ping":   true,
 	"/version": true,
@@ -498,18 +505,14 @@ var globalReadPaths = map[string]bool{
 	"/images/json":     true,
 	"/networks":        true,
 	"/system/df":       true,
+	// /volumes is the volume LIST. It was briefly removed here on the theory
+	// that it gated the enumeration half of BWAICODE-4 (a Binds entry with
+	// no slash is treated as a named volume and never validated). It does
+	// not: /system/df and /containers/json, both above and both required,
+	// return the same volume names. The removal closed nothing and broke
+	// `docker volume ls`, so it is restored.
+	"/volumes": true,
 	// Deliberately NOT here:
-	//
-	//   /volumes — the volume LIST. A volume name is directly actionable:
-	//     validateContainerCreate treats any Binds entry without a slash as
-	//     a Docker-managed named volume and does not validate it
-	//     (BWAICODE-4), so enumerate-then-bind reads another project's data.
-	//     Compose does not need the list: it resolves named volumes with
-	//     inspect-by-name (allowed below) and falls back to create. The
-	//     costs are `docker volume ls` and the discovery step of
-	//     `compose down -v`, whose actual removal is a DELETE that the write
-	//     model already denies. Restore by re-adding this one entry if a
-	//     real workflow turns out to need it.
 	//
 	//   /build/cache — not a Docker route at all (the builder endpoint is
 	//     POST /build/prune), so listing it allowed nothing and only
@@ -598,7 +601,11 @@ func (v *Validator) validateRead(r *http.Request) Decision {
 		// per-container data, so allow the read.
 		return allow("network inspect allowed")
 	case ReVolumeInspect.MatchString(path):
-		// Same reasoning as networks: /volumes above already lists them.
+		// Volume metadata is not per-container data, and its Mountpoint is
+		// under /var/lib/docker/volumes, which IsVolumePathAllowed rejects.
+		// Compose resolves named volumes through this route. Volume *names*
+		// are host-wide visible regardless (see globalReadPaths), so this
+		// route is not a gate on anything.
 		return allow("volume inspect allowed")
 	default:
 		return deny(fmt.Sprintf("read endpoint not allowed: %s %s", r.Method, r.URL.Path))

@@ -60,14 +60,9 @@ func TestReadsAreModelledNotBlanketAllowed(t *testing.T) {
 	tracker.Add("mine123")
 	v := NewValidator(cfg, tracker)
 
-	// NOTE: the task brief also listed "/volumes" here. The volume LIST is
-	// deliberately not global — a volume name is directly actionable through
-	// the unvalidated named-volume bind (BWAICODE-4), so enumeration is the
-	// first half of a cross-project data read. Inspect-by-name, which is what
-	// compose actually uses, stays allowed and is asserted below.
 	allowedGlobals := []string{
 		"/_ping", "/version", "/info",
-		"/containers/json", "/images/json", "/networks",
+		"/containers/json", "/images/json", "/networks", "/volumes",
 		"/v1.45/containers/json", "/v1.45/version",
 	}
 	for _, u := range allowedGlobals {
@@ -144,20 +139,30 @@ func TestReadsAreModelledNotBlanketAllowed(t *testing.T) {
 		}
 	})
 
-	t.Run("volume list is denied, volume inspect is allowed", func(t *testing.T) {
-		if d := v.Validate(makeRequest("GET", "/v1.45/volumes", "")); d.Allow {
-			t.Error("volume enumeration must be denied: a volume name is directly bindable (BWAICODE-4)")
-		}
-		if d := v.Validate(makeRequest("GET", "/v1.45/volumes/myproj_data", "")); !d.Allow {
-			t.Errorf("volume inspect-by-name should be allowed, got deny: %s", d.Reason)
+	// Volume names are host-wide visible through /volumes, /system/df
+	// (Volumes[].Name) and /containers/json (Mounts[].Name). Denying any one
+	// of those routes hides nothing, because /containers/json is what
+	// `docker ps` needs and cannot go. Both routes below are allowed, and the
+	// residual is closed by response filtering, not by this list.
+	t.Run("volume list and inspect are both allowed", func(t *testing.T) {
+		for _, u := range []string{"/v1.45/volumes", "/v1.45/volumes/myproj_data"} {
+			if d := v.Validate(makeRequest("GET", u, "")); !d.Allow {
+				t.Errorf("GET %s should be allowed, got deny: %s", u, d.Reason)
+			}
 		}
 	})
 }
 
 // ReImageInspect must take (.+) to accept registry/repository image names,
-// and .+ crosses "/". Without a canonical-path requirement these reach
-// container inspect through the image route. Probed and confirmed allowed
-// before the fix.
+// and .+ crosses "/". Without a canonical-path requirement, traversal
+// reaches container inspect through the image route.
+//
+// Only the first three paths below are regression proof: they were probed
+// against the pre-fix build (commit 8d2fd18) and returned
+// allow("image inspect allowed"). The two after them, marked as such, were
+// already denied there — ReImageInspect only matches a json|history suffix,
+// so an /archive or /export target never reached it. They are coverage for
+// the shape, not evidence of a closed hole.
 func TestReadTraversalViaImageInspect(t *testing.T) {
 	cfg := &config.Config{
 		ProjectDir:      "/project",
@@ -172,7 +177,7 @@ func TestReadTraversalViaImageInspect(t *testing.T) {
 		"/images/../containers/someoneelse/json",
 		"/images/x/../../containers/someoneelse/json",
 		"/v1.45/images/../containers/someoneelse/json",
-		// The same trick aimed at the endpoint that actually leaks bytes.
+		// Coverage only, already denied pre-fix (no json|history suffix):
 		"/images/../containers/someoneelse/archive",
 		"/v1.45/images/a/b/../../../containers/someoneelse/export",
 	} {
@@ -239,10 +244,9 @@ func TestReadModelBoundary(t *testing.T) {
 		"/plugins",
 		"/images/search",
 		"/containers/mine123/attach/ws",
-		// Volume enumeration (see BWAICODE-4), and two entries that used to
-		// sit in globalReadPaths without being real routes.
-		"/volumes",
-		"/v1.45/volumes",
+		// Two entries that once sat in globalReadPaths without being real
+		// routes; nothing turns on them, they are here so the map does not
+		// quietly regrow them.
 		"/build/cache",
 		"/distribution",
 		"/distribution/postgres/json",

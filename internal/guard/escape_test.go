@@ -301,9 +301,13 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 		// such a volume with a bind DriverConfig goes through POST /volumes/
 		// create, which the write model denies (unmodelled route).
 		//
-		// The mitigation that IS in place: /volumes (the LIST) was removed
-		// from globalReadPaths, so a caller cannot enumerate volume names to
-		// pick a target. That is defence in depth, not a fix.
+		// There is NO mitigation on the enumeration half, and this gate no
+		// longer claims one. /volumes was briefly removed from
+		// globalReadPaths on that theory, but /system/df returns
+		// Volumes[].Name and /containers/json returns Mounts[].Name for the
+		// whole host, and /containers/json is what `docker ps` runs on, so it
+		// cannot be removed. Route removal hides nothing here; only
+		// ownership-filtered response bodies would.
 		//
 		// This subtest asserts the CURRENT behaviour honestly. If it starts
 		// failing, BWAICODE-4 was fixed: delete this subtest and move the
@@ -314,12 +318,9 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 			t.Errorf("BWAICODE-4 appears to be FIXED (named-volume bind now denied: %s) — "+
 				"update this gate to assert the closure instead of the residual", d.Reason)
 		}
-
-		// The one thing that IS closed: the enumeration step. /volumes must
-		// not be listable, so a caller cannot discover a name to bind.
-		if d := v.Validate(makeRequest("GET", "/v1.45/volumes", "")); d.Allow {
-			t.Error("BWAICODE-4 mitigation open: /volumes list allowed, so named volumes are enumerable")
-		}
+		// The enumeration half of this residual is a READ concern, so it is
+		// asserted in read_volume_names_are_host_wide_visible below rather
+		// than here.
 	})
 
 	t.Run("mount_unknown_or_empty_type_is_denied", func(t *testing.T) {
@@ -587,7 +588,6 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 			"/v1.45/swarm",
 			"/v1.45/nodes",
 			"/v1.45/configs",
-			"/v1.45/volumes",                          // list deliberately removed
 			"/v1.45/distribution/moby/buildkit/json",  // unmodelled per-image probe
 			"/v1.45/images/../containers/other/json",  // traversal into a per-container read
 			"/v1.45/containers/other/json/../../json", // dot segments
@@ -623,9 +623,34 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 		if d := v.Validate(makeRequest("GET", "/v1.45/containers/"+seededFullID+"/json", "")); !d.Allow {
 			t.Errorf("regression: owned container inspect denied: %s", d.Reason)
 		}
-		for _, path := range []string{"/_ping", "/v1.45/version", "/v1.45/containers/json", "/v1.45/images/json", "/v1.45/networks"} {
+		for _, path := range []string{"/_ping", "/v1.45/version", "/v1.45/containers/json", "/v1.45/images/json", "/v1.45/networks", "/v1.45/volumes"} {
 			if d := v.Validate(makeRequest("GET", path, "")); !d.Allow {
 				t.Errorf("regression: global read %s denied: %s", path, d.Reason)
+			}
+		}
+	})
+
+	t.Run("read_volume_names_are_host_wide_visible_KNOWN_RESIDUAL", func(t *testing.T) {
+		// RESIDUAL, NOT CLOSED. The read half of BWAICODE-4.
+		//
+		// Volume names of every project on the host are readable, and no
+		// route decision changes that: /volumes lists them, /system/df
+		// returns Volumes[].Name (and Mountpoint), and /containers/json
+		// returns Mounts[].Name. The last of those is what `docker ps` runs
+		// on, so it cannot be removed. Only ownership-filtered response
+		// bodies would close this; the guard forwards responses untouched.
+		//
+		// /volumes was briefly removed from globalReadPaths as a mitigation.
+		// It was not one, and this subtest exists so nobody tries again
+		// believing the route list controls the disclosure.
+		//
+		// Asserts CURRENT behaviour. If one of these starts denying, the
+		// residual changed shape: work out which route closed and why, and
+		// rewrite this subtest rather than deleting the assertion.
+		for _, u := range []string{"/v1.45/volumes", "/v1.45/system/df", "/v1.45/containers/json"} {
+			if d := v.Validate(makeRequest("GET", u, "")); !d.Allow {
+				t.Errorf("GET %s now denies (%s) — all three disclose host-wide volume "+
+					"names today; update this gate to state the new residual", u, d.Reason)
 			}
 		}
 	})
