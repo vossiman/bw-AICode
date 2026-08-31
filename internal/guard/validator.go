@@ -112,9 +112,11 @@ func readBody(r *http.Request) ([]byte, error) {
 
 // Validate inspects the given HTTP request and decides whether to allow or deny it.
 func (v *Validator) Validate(r *http.Request) Decision {
-	// 1. GET/HEAD → always allow
+	// 1. Reads are modelled explicitly, not blanket-allowed. A blanket GET
+	//    allow made GET /containers/{any}/archive a cross-container file
+	//    read (CAF-001).
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		return allow("read-only request")
+		return v.validateRead(r)
 	}
 
 	// 2. Read-only mode → deny all write operations
@@ -162,8 +164,8 @@ func (v *Validator) Validate(r *http.Request) Decision {
 	case ReContainerWait.MatchString(path):
 		return v.validateContainerAccess(path, ReContainerWait, "wait")
 
-	case ReContainerLogs.MatchString(path):
-		return v.validateContainerAccess(path, ReContainerLogs, "logs")
+	// /containers/{id}/logs is a GET and is handled by validateRead; it has
+	// no write form, so it is deliberately absent from this switch.
 
 	case ReContainerResize.MatchString(path):
 		return v.validateContainerAccess(path, ReContainerResize, "resize")
@@ -470,6 +472,108 @@ func (v *Validator) validateNetworkCreate(r *http.Request) Decision {
 	}
 
 	return allow("network create allowed")
+}
+
+// globalReadPaths are read endpoints that expose no per-container data and
+// are safe to allow wholesale. Anything not listed is denied by default.
+//
+// Entries mapped to false are documentation: they are endpoints considered
+// and deliberately NOT allowed (a false value reads the same as absent).
+var globalReadPaths = map[string]bool{
+	"/_ping":   true,
+	"/version": true,
+	"/info":    true,
+	// /events streams host-wide container lifecycle, so it does disclose
+	// other projects' container names. It is kept allowed because
+	// /containers/json, directly above, already discloses the same
+	// host-wide inventory in snapshot form, and compose/CLI attach flows
+	// depend on the stream. Narrowing the two together needs response-body
+	// filtering (a separate change); until then this is one recorded
+	// residual, not two, and it is not widened here.
+	"/events":          true,
+	"/containers/json": true,
+	"/images/json":     true,
+	"/networks":        true,
+	"/volumes":         true,
+	"/build/cache":     true,
+	"/system/df":       true,
+	"/distribution":    false,
+}
+
+// validateRead decides GET/HEAD requests. Global list endpoints are allowed;
+// per-container reads require the same ownership the write path requires.
+// Anything the model does not recognise is denied.
+func (v *Validator) validateRead(r *http.Request) Decision {
+	// RawPath is set only when the request's escaped path differs from the
+	// decoded URL.Path, i.e. the caller percent-encoded something. Docker's
+	// own clients never do that for these routes, while an attacker would
+	// use it to make the guard and the daemon disagree about where one path
+	// segment ends (%2f as a separator, %2e%2e as a dot segment). Refuse the
+	// ambiguity rather than pick a side.
+	if r.URL.RawPath != "" && r.URL.RawPath != r.URL.Path {
+		return deny(fmt.Sprintf("percent-encoded read path is not allowed: %s %s", r.Method, r.URL.RawPath))
+	}
+
+	// Match on the version-stripped path. Go's net/http does not clean
+	// URL.Path for a plain http.Handler (only ServeMux redirects), so
+	// traversal like /containers/../containers/x/archive arrives verbatim —
+	// and because every pattern below is anchored at both ends with [^/]+
+	// for the ID, such a path matches nothing and falls through to deny.
+	path := stripVersion(r.URL.Path)
+
+	// After stripping exactly one well-formed prefix, nothing version-shaped
+	// may remain: that means either a doubled prefix or a malformed one
+	// ("/v1./…", "/v../…"). The read patterns below carry their own loose
+	// `(/v[\d.]+)?` group, so without this check such a residue would still
+	// match them; the daemon would route the same path somewhere else
+	// entirely. Deny instead of guessing.
+	if reLooseVersionPrefix.MatchString(path) {
+		return deny(fmt.Sprintf("malformed API version prefix in read path: %s %s", r.Method, r.URL.Path))
+	}
+
+	if globalReadPaths[path] {
+		return allow("global read allowed")
+	}
+
+	switch {
+	case ReContainerArchive.MatchString(path):
+		// The CAF-001 leak: GET *and* HEAD, since HEAD on this endpoint
+		// discloses a path's existence and its stat metadata.
+		return v.validateContainerAccess(path, ReContainerArchive, "archive read")
+	case ReContainerJSON.MatchString(path):
+		return v.validateContainerAccess(path, ReContainerJSON, "inspect")
+	case ReContainerLogs.MatchString(path):
+		return v.validateContainerAccess(path, ReContainerLogs, "logs")
+	case ReContainerStats.MatchString(path):
+		return v.validateContainerAccess(path, ReContainerStats, "stats")
+	case ReContainerChanges.MatchString(path):
+		return v.validateContainerAccess(path, ReContainerChanges, "changes")
+	case ReContainerTop.MatchString(path):
+		return v.validateContainerAccess(path, ReContainerTop, "top")
+	case ReContainerExport.MatchString(path):
+		return v.validateContainerAccess(path, ReContainerExport, "export")
+	case ReExecInspect.MatchString(path):
+		// docker exec reads the exit code from here; gate it on the same
+		// exec ownership /exec/{id}/start uses.
+		matches := ReExecInspect.FindStringSubmatch(path)
+		if !v.tracker.IsExecOwned(matches[2]) {
+			return deny(fmt.Sprintf("exec %q is not owned by this session", matches[2]))
+		}
+		return allow("exec inspect allowed")
+	case ReImageInspect.MatchString(path):
+		// Image metadata is not per-container data, and /images/json above
+		// already lists every image on the host.
+		return allow("image inspect allowed")
+	case ReNetworkDelete.MatchString(path):
+		// Same shape as /networks/{id} inspect; network metadata is not
+		// per-container data, so allow the read.
+		return allow("network inspect allowed")
+	case ReVolumeInspect.MatchString(path):
+		// Same reasoning as networks: /volumes above already lists them.
+		return allow("volume inspect allowed")
+	default:
+		return deny(fmt.Sprintf("read endpoint not allowed: %s %s", r.Method, r.URL.Path))
+	}
 }
 
 // validateContainerAccess checks ownership for container endpoints that take

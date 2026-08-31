@@ -140,7 +140,16 @@ From these, the proxy extracts: allowed images, allowed networks, compose projec
 
 The proxy is **deny-by-default**. Only explicitly modeled operations are allowed:
 
-- **Read operations** (GET/HEAD): always allowed
+- **Read operations** (GET/HEAD): modelled explicitly, not blanket-allowed.
+  A fixed set of host-wide endpoints that carry no per-container payload is
+  allowed (`/_ping`, `/version`, `/info`, `/events`, `/containers/json`,
+  `/images/json`, `/networks`, `/volumes`, `/build/cache`, `/system/df`,
+  plus image, network and volume inspect). Per-container reads
+  (`/containers/{id}/` `json`, `archive`, `logs`, `stats`, `changes`, `top`,
+  `export`) require the **same ownership check the write path uses**, and so
+  does exec inspect. Any read path the model does not recognise is denied.
+  The allowed host-wide endpoints do disclose the *names* of other projects'
+  containers, images and networks; they do not disclose their contents.
 - **Container create**: image must be in allowlist, volume mounts must be under project directory (symlink-resolved), dangerous flags blocked (`--privileged`, `--pid=host`, `--network=host`, `--userns=host`, `--ipc=host`, `--cgroupns=host`, `--uts=host`, `--cap-add`, `--device`, `--volumes-from`, `--security-opt`)
 - **Container lifecycle** (start/stop/restart/kill/attach/wait/logs/resize/exec/rm): only on containers owned by this session (created through the proxy or belonging to the compose project)
 - **Image pull**: only allowlisted images

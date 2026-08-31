@@ -45,33 +45,194 @@ func makeRequest(method, url, body string) *http.Request {
 	return r
 }
 
-// Test 19: GET requests always allowed
-func TestValidateGETAlwaysAllowed(t *testing.T) {
-	v, _ := newTestValidator()
-
-	urls := []string{
-		"/containers/json",
-		"/v1.45/containers/json",
-		"/images/json",
-		"/v1.45/networks",
-		"/volumes",
+// Test 19 (inverted). Was TestValidateGETAlwaysAllowed, which asserted that
+// every GET is allowed. A blanket GET allow is CAF-001's cross-container
+// read: GET /containers/{any}/archive?path=/ exfiltrates files from
+// containers belonging to other projects. The old assertion encoded the
+// hole, so it is inverted here rather than deleted.
+func TestReadsAreModelledNotBlanketAllowed(t *testing.T) {
+	cfg := &config.Config{
+		ProjectDir:      "/project",
+		AllowedImages:   []string{"postgres:16"},
+		VolumeMountRoot: "/project",
 	}
+	tracker := ownership.New()
+	tracker.Add("mine123")
+	v := NewValidator(cfg, tracker)
 
-	for _, u := range urls {
-		t.Run("GET "+u, func(t *testing.T) {
-			r := makeRequest("GET", u, "")
-			d := v.Validate(r)
-			if !d.Allow {
+	allowedGlobals := []string{
+		"/_ping", "/version", "/info",
+		"/containers/json", "/images/json", "/networks", "/volumes",
+		"/v1.45/containers/json", "/v1.45/version",
+	}
+	for _, u := range allowedGlobals {
+		t.Run("GET "+u+" allowed", func(t *testing.T) {
+			if d := v.Validate(makeRequest("GET", u, "")); !d.Allow {
 				t.Errorf("GET %s should be allowed, got deny: %s", u, d.Reason)
 			}
 		})
-		t.Run("HEAD "+u, func(t *testing.T) {
-			r := makeRequest("HEAD", u, "")
-			d := v.Validate(r)
-			if !d.Allow {
+		t.Run("HEAD "+u+" allowed", func(t *testing.T) {
+			if d := v.Validate(makeRequest("HEAD", u, "")); !d.Allow {
 				t.Errorf("HEAD %s should be allowed, got deny: %s", u, d.Reason)
 			}
 		})
+	}
+
+	t.Run("archive of an owned container is allowed", func(t *testing.T) {
+		r := makeRequest("GET", "/v1.45/containers/mine123/archive?path=/etc", "")
+		if d := v.Validate(r); !d.Allow {
+			t.Errorf("owned container archive should be allowed, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("archive of a foreign container is DENIED", func(t *testing.T) {
+		r := makeRequest("GET", "/v1.45/containers/someoneelse/archive?path=/", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: cross-container archive read must be denied")
+		}
+	})
+
+	t.Run("HEAD archive of a foreign container is DENIED", func(t *testing.T) {
+		r := makeRequest("HEAD", "/v1.45/containers/someoneelse/archive?path=/", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: HEAD must be modelled the same as GET")
+		}
+	})
+
+	t.Run("inspect of a foreign container is denied", func(t *testing.T) {
+		r := makeRequest("GET", "/v1.45/containers/someoneelse/json", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("inspecting a foreign container must be denied")
+		}
+	})
+
+	t.Run("logs of a foreign container is denied", func(t *testing.T) {
+		r := makeRequest("GET", "/v1.45/containers/someoneelse/logs", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("reading a foreign container's logs must be denied")
+		}
+	})
+
+	t.Run("export of a foreign container is denied", func(t *testing.T) {
+		r := makeRequest("GET", "/v1.45/containers/someoneelse/export", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("exporting a foreign container's filesystem must be denied")
+		}
+	})
+
+	t.Run("stats/changes/top of a foreign container are denied", func(t *testing.T) {
+		for _, u := range []string{
+			"/v1.45/containers/someoneelse/stats",
+			"/v1.45/containers/someoneelse/changes",
+			"/v1.45/containers/someoneelse/top",
+		} {
+			if d := v.Validate(makeRequest("GET", u, "")); d.Allow {
+				t.Errorf("GET %s must be denied", u)
+			}
+		}
+	})
+
+	t.Run("unmodelled read endpoint is denied", func(t *testing.T) {
+		r := makeRequest("GET", "/v1.45/secrets", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("an unmodelled read endpoint must be denied by default")
+		}
+	})
+}
+
+// The deny-by-default boundary of the read model: anything that is not an
+// exact global path or an exactly-matched modelled route must deny, and no
+// path trick may turn a foreign container read into a match.
+func TestReadModelBoundary(t *testing.T) {
+	cfg := &config.Config{
+		ProjectDir:      "/project",
+		AllowedImages:   []string{"postgres:16"},
+		VolumeMountRoot: "/project",
+	}
+	tracker := ownership.New()
+	tracker.Add("mine123")
+	v := NewValidator(cfg, tracker)
+
+	denied := []string{
+		// Traversal: net/http hands us the path uncleaned, and the anchored
+		// patterns match none of these.
+		"/containers/../containers/someoneelse/archive",
+		"/containers/mine123/../someoneelse/archive",
+		"/v1.45/containers/mine123/archive/../../someoneelse/archive",
+		// Percent-encoded separators and dot segments.
+		"/containers/mine123%2f..%2fsomeoneelse/archive",
+		"/containers/%2e%2e/someoneelse/archive",
+		// Trailing slash and empty ID.
+		"/version/",
+		"/containers/json/",
+		"/containers//archive",
+		"/v1.45/containers/mine123/archive/",
+		// Doubled and malformed version prefixes must not normalise into a
+		// match, and must not be stripped into a global allow.
+		"/v1.45/v1.45/containers/someoneelse/archive",
+		"/v1./containers/mine123/archive",
+		"/v../version",
+		// Unmodelled reads.
+		"/v1.45/secrets",
+		"/swarm",
+		"/nodes",
+		"/tasks",
+		"/plugins",
+		"/images/search",
+		"/containers/mine123/attach/ws",
+	}
+	for _, u := range denied {
+		t.Run("GET "+u, func(t *testing.T) {
+			if d := v.Validate(makeRequest("GET", u, "")); d.Allow {
+				t.Errorf("GET %s must be denied, got allow: %s", u, d.Reason)
+			}
+		})
+	}
+
+	// A container whose *name* looks like an API version prefix is still
+	// treated as a container name, not stripped away.
+	t.Run("version-shaped container name is not stripped", func(t *testing.T) {
+		if d := v.Validate(makeRequest("GET", "/containers/v1.45/json", "")); d.Allow {
+			t.Errorf("a container named v1.45 is not owned; got allow: %s", d.Reason)
+		}
+	})
+
+	// Owned reads still work with and without a version prefix.
+	allowed := []string{
+		"/containers/mine123/json",
+		"/v1.45/containers/mine123/json",
+		"/v1.45/containers/mine123/logs",
+		"/v1.45/containers/mine123/stats",
+		"/v1.45/containers/mine123/top",
+		"/v1.45/containers/mine123/changes",
+		"/v1.45/containers/mine123/export",
+	}
+	for _, u := range allowed {
+		t.Run("GET "+u+" allowed", func(t *testing.T) {
+			if d := v.Validate(makeRequest("GET", u, "")); !d.Allow {
+				t.Errorf("GET %s should be allowed, got deny: %s", u, d.Reason)
+			}
+		})
+	}
+}
+
+func TestStripVersion(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"/version", "/version"},
+		{"/v1.45/version", "/version"},
+		{"/v1.45.1/containers/json", "/containers/json"},
+		{"/v1", "/"},
+		{"/v1.45", "/"},
+		{"/volumes", "/volumes"},
+		{"/v1./containers/json", "/v1./containers/json"},
+		{"/v../version", "/v../version"},
+		{"/v1.45/v1.45/version", "/v1.45/version"},
+		{"/containers/v1.45/json", "/containers/v1.45/json"},
+	}
+	for _, tt := range tests {
+		if got := stripVersion(tt.in); got != tt.want {
+			t.Errorf("stripVersion(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }
 
@@ -1089,11 +1250,20 @@ func TestValidateContainerAccess(t *testing.T) {
 	v, tracker := newTestValidator()
 	tracker.Add("owned123abc")
 
-	operations := []string{"attach", "wait", "logs", "resize"}
+	// /logs is a GET in the Docker API and is now decided by the read model,
+	// so it is exercised with its real method; POST /logs is not a route and
+	// is denied by default.
+	operations := []struct{ method, op string }{
+		{"POST", "attach"},
+		{"POST", "wait"},
+		{"GET", "logs"},
+		{"POST", "resize"},
+	}
 
-	for _, op := range operations {
+	for _, tc := range operations {
+		method, op := tc.method, tc.op
 		t.Run(op+" owned allowed", func(t *testing.T) {
-			r := makeRequest("POST", "/v1.45/containers/owned123abc/"+op, "")
+			r := makeRequest(method, "/v1.45/containers/owned123abc/"+op, "")
 			d := v.Validate(r)
 			if !d.Allow {
 				t.Errorf("%s owned container should be allowed, got deny: %s", op, d.Reason)
@@ -1101,7 +1271,7 @@ func TestValidateContainerAccess(t *testing.T) {
 		})
 
 		t.Run(op+" unowned denied", func(t *testing.T) {
-			r := makeRequest("POST", "/v1.45/containers/unknown999/"+op, "")
+			r := makeRequest(method, "/v1.45/containers/unknown999/"+op, "")
 			d := v.Validate(r)
 			if d.Allow {
 				t.Errorf("%s unowned container should be denied", op)
@@ -1112,7 +1282,7 @@ func TestValidateContainerAccess(t *testing.T) {
 		})
 
 		t.Run(op+" unversioned owned", func(t *testing.T) {
-			r := makeRequest("POST", "/containers/owned123abc/"+op, "")
+			r := makeRequest(method, "/containers/owned123abc/"+op, "")
 			d := v.Validate(r)
 			if !d.Allow {
 				t.Errorf("unversioned %s owned should be allowed, got deny: %s", op, d.Reason)
