@@ -172,14 +172,22 @@ The proxy is **deny-by-default**. Only explicitly modeled operations are allowed
   `--pid=host`, `--network=host`, `--userns=host`, `--ipc=host`
   (including `container:<id>` pivoting to a host-namespaced container),
   `--cgroupns=host`, `--uts=host`, `--cap-add`, `--device`,
-  `--volumes-from`, `--security-opt`. `Privileged` is rejected too, *unless*
-  the image matches a pinned infra digest, in which case that one field
-  relaxes because real buildkit requires it.
+  `--device-cgroup-rule`, `--gpus`, `--volumes-from`, `--security-opt`,
+  `--security-opt systempaths=unconfined` (which the CLI sends as empty
+  `MaskedPaths`/`ReadonlyPaths` arrays, not as a `SecurityOpt` entry).
+  `Privileged` is rejected too, *unless* the image matches a pinned infra
+  digest **and** the create supplies no `Entrypoint` or `Cmd` — the digest
+  pins the image's content, not the command it is asked to run.
+  **Any `HostConfig` field the guard has not explicitly reasoned about is
+  denied**, rather than passed through; see "Unknown fields fail closed".
 - **Container lifecycle** (start/stop/restart/kill/attach/wait/resize/exec/rm):
   only on containers owned by this session — ownership comes from containers
   created through the proxy, plus a host-side `docker ps` snapshot seeded at
   session start (`preowned_containers`), matched on full container ID or
-  name. There is no name-prefix shortcut.
+  name. There is no name-prefix shortcut. **`exec` and `attach` are denied
+  on seeded containers in every mode**: seeding exists so the session can
+  manage buildkit's lifecycle, and that container runs privileged, so a
+  shell inside it is a host escape.
 - **Image pull**: only allowlisted images, or an infra image matched by
   digest.
 - **Build**: requires every `-t` tag to be in the allowlist; an untagged
@@ -200,7 +208,10 @@ resolves. Only the latter grants privilege.
   matched by content digest, resolved host-side via `docker image inspect`
   at session start, never by name or tag. A digest names content, so a
   caller cannot mint one by choosing a string. Matching an infra digest
-  relaxes exactly one `HostConfig` field, `Privileged`; every other field
+  relaxes exactly one `HostConfig` field, `Privileged`, and only for a
+  create that supplies no `Entrypoint` and no `Cmd`: the digest pins what
+  the image *is*, while the command stays caller-chosen, and the digest is
+  public (`GET /images/json` returns `RepoDigests`). Every other field
   (namespaces, capabilities, devices, mounts, `VolumesFrom`,
   `SecurityOpt`) is still enforced unconditionally, infra image or not.
 - **Pre-existing infrastructure containers** are seeded into the ownership
@@ -215,6 +226,35 @@ resolves. Only the latter grants privilege.
   input the guard exists to constrain. An explicit `-v` naming a Docker
   socket path is refused even when the caller lists it, and even when it
   falls inside an otherwise-allowed path.
+
+### Unknown fields fail closed
+
+Container create is validated against an explicit list of fields the guard
+has reasoned about (`createKnownKeys` and `hostConfigKnownKeys` in
+`internal/guard/validator.go`). A body carrying any other key is denied.
+
+This inverts what the guard used to do. It enumerated the *dangerous*
+`HostConfig` fields and denied those, which meant every field it had not
+heard of was silently permitted — and the same host escape was then found
+six separate times, each one only after the previous had been closed:
+`Binds`; `HostConfig.Mounts` read from the wrong struct level; a
+`Type: "volume"` inline driver bind; a named-volume bind; empty
+`MaskedPaths`/`ReadonlyPaths`; and `DeviceCgroupRules`.
+
+The trade is deliberate. When a future Docker version adds a `HostConfig`
+field, the guard denies creates that use it until someone adds it to the
+list *with the reason it is safe*. A denied create the day the API changes
+is a much cheaper failure than a permitted escape nobody notices. Each
+entry in those lists carries a one-line comment saying why it is there;
+fields deliberately left out (`Sysctls`, `Runtime`, `StorageOpt`,
+`Annotations`, …) are named in a comment too, so "not listed" reads as a
+decision rather than an oversight.
+
+`internal/guard/escape_test.go` pins this with verbatim container-create
+bodies captured from a real `docker create` and `docker compose create`
+(the CLI marshals all 62 `HostConfig` keys on every call, zero values
+included), so a list that is too narrow fails the test suite rather than
+the user's build.
 
 ### What the guard blocks
 

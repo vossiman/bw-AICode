@@ -515,6 +515,34 @@ else
   fi
 fi
 
+# Run with --security-opt systempaths=unconfined — should be blocked.
+#
+# The CLI translates this CLIENT-SIDE into HostConfig.MaskedPaths: [] and
+# ReadonlyPaths: [], and sends an EMPTY SecurityOpt array, so the guard's
+# SecurityOpt check never sees it. An empty array replaces the daemon's
+# defaults: /proc/sys loses its read-only bind, and core_pattern is
+# host-global. The probe only TESTS writability, it does not write.
+output="$(docker_via_guard run --rm --security-opt systempaths=unconfined alpine \
+  sh -c 'test -w /proc/sys/kernel/core_pattern && echo ESCAPED' 2>&1 || true)"
+if echo "$output" | grep -q "ESCAPED"; then
+  fail "guarded: --security-opt systempaths=unconfined" "/proc/sys became writable (host escape)"
+else
+  ok "guarded: --security-opt systempaths=unconfined blocked"
+fi
+
+# Run with --device-cgroup-rule — should be blocked.
+#
+# Devices is denied, but the device cgroup is the only barrier left: CAP_MKNOD
+# is in Docker's DEFAULT capability set, so a rule plus mknod reaches the
+# host's raw block devices. The probe reads one byte of major 8 minor 0.
+output="$(docker_via_guard run --rm --device-cgroup-rule='b 8:* rwm' alpine \
+  sh -c 'mknod /tmp/hostdisk b 8 0 && head -c1 /tmp/hostdisk >/dev/null && echo ESCAPED' 2>&1 || true)"
+if echo "$output" | grep -q "ESCAPED"; then
+  fail "guarded: --device-cgroup-rule" "raw host block device readable (host escape)"
+else
+  ok "guarded: --device-cgroup-rule blocked"
+fi
+
 # Run disallowed image — should be blocked
 output="$(docker_via_guard run --rm ubuntu echo hi 2>&1 || true)"
 if echo "$output" | grep -qi "bw-docker-guard\|403\|forbidden\|denied\|not allowed"; then

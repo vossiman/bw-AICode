@@ -11,18 +11,18 @@ import (
 
 // Known Docker/Podman socket basenames that must never be volume-mounted.
 var socketBasenames = map[string]bool{
-	"docker.sock":    true,
-	"docker.socket":  true,
-	"podman.sock":    true,
-	"podman.socket":  true,
+	"docker.sock":   true,
+	"docker.socket": true,
+	"podman.sock":   true,
+	"podman.socket": true,
 }
 
 // Known absolute paths to Docker/Podman sockets.
 var knownSocketPaths = map[string]bool{
-	"/var/run/docker.sock":  true,
-	"/run/docker.sock":      true,
-	"/var/run/podman.sock":  true,
-	"/run/podman.sock":      true,
+	"/var/run/docker.sock": true,
+	"/run/docker.sock":     true,
+	"/var/run/podman.sock": true,
+	"/run/podman.sock":     true,
 }
 
 // socketParentDirs are directories whose contents are the sockets above:

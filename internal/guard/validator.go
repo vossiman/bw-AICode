@@ -49,29 +49,250 @@ type mountEntry struct {
 	Target string `json:"Target"`
 }
 
+// logConfig mirrors HostConfig.LogConfig.
+type logConfig struct {
+	Type string `json:"Type"`
+}
+
+// hostConfigFields is the subset of HostConfig this guard reads. Fields that
+// are merely *permitted* are deliberately NOT here: they are listed in
+// hostConfigKnownKeys instead, which is what decides whether a key may appear
+// at all. See validateHostConfigKeys for the reasoning.
+type hostConfigFields struct {
+	Binds             []string          `json:"Binds"`
+	Mounts            []mountEntry      `json:"Mounts"`
+	Privileged        bool              `json:"Privileged"`
+	PidMode           string            `json:"PidMode"`
+	NetworkMode       string            `json:"NetworkMode"`
+	UsernsMode        string            `json:"UsernsMode"`
+	IpcMode           string            `json:"IpcMode"`
+	CgroupnsMode      string            `json:"CgroupnsMode"`
+	UTSMode           string            `json:"UTSMode"`
+	CapAdd            []string          `json:"CapAdd"`
+	Devices           []deviceMapping   `json:"Devices"`
+	VolumesFrom       []string          `json:"VolumesFrom"`
+	SecurityOpt       []string          `json:"SecurityOpt"`
+	DeviceCgroupRules []string          `json:"DeviceCgroupRules"`
+	DeviceRequests    []json.RawMessage `json:"DeviceRequests"`
+	ContainerIDFile   string            `json:"ContainerIDFile"`
+	Cgroup            string            `json:"Cgroup"`
+	CgroupParent      string            `json:"CgroupParent"`
+	VolumeDriver      string            `json:"VolumeDriver"`
+	Links             []string          `json:"Links"`
+	LogConfig         logConfig         `json:"LogConfig"`
+
+	// MaskedPaths and ReadonlyPaths are POINTERS on purpose. The daemon
+	// applies its own defaults only when these are absent (JSON null); a
+	// non-nil EMPTY array replaces the defaults with nothing, which unmasks
+	// /proc/kcore and drops the read-only bind over /proc/sys — i.e.
+	// host-global writes such as /proc/sys/kernel/core_pattern. `docker run
+	// --security-opt systempaths=unconfined` is translated client-side into
+	// exactly that, and sends SecurityOpt as an empty array, so the
+	// SecurityOpt length check below never sees it. A plain value type could
+	// not tell `null` (the normal case, sent by every docker run) from `[]`
+	// (the attack), so nil-vs-non-nil is the whole check.
+	MaskedPaths   *[]string `json:"MaskedPaths"`
+	ReadonlyPaths *[]string `json:"ReadonlyPaths"`
+}
+
 // containerCreateRequest is the subset of fields we inspect from container create.
 type containerCreateRequest struct {
-	Image      string `json:"Image"`
-	HostConfig struct {
-		Binds        []string        `json:"Binds"`
-		Mounts       []mountEntry    `json:"Mounts"`
-		Privileged   bool            `json:"Privileged"`
-		PidMode      string          `json:"PidMode"`
-		NetworkMode  string          `json:"NetworkMode"`
-		UsernsMode   string          `json:"UsernsMode"`
-		IpcMode      string          `json:"IpcMode"`
-		CgroupnsMode string          `json:"CgroupnsMode"`
-		UTSMode      string          `json:"UTSMode"`
-		CapAdd       []string        `json:"CapAdd"`
-		Devices      []deviceMapping `json:"Devices"`
-		VolumesFrom  []string        `json:"VolumesFrom"`
-		SecurityOpt  []string        `json:"SecurityOpt"`
-	} `json:"HostConfig"`
-	// Mounts at the top level is not a real Docker Engine API field (the
-	// engine only reads HostConfig.Mounts), but is kept here, harmlessly, in
-	// case any caller-side tooling sends it; only HostConfig.Mounts is
-	// actually validated below.
-	Mounts []mountEntry `json:"Mounts"`
+	Image string `json:"Image"`
+	// Entrypoint and Cmd are RawMessage because the API accepts both a
+	// string and a string array for each. Only their emptiness matters here
+	// (see the infra-trust check in validateContainerCreate).
+	Entrypoint json.RawMessage  `json:"Entrypoint"`
+	Cmd        json.RawMessage  `json:"Cmd"`
+	HostConfig hostConfigFields `json:"HostConfig"`
+}
+
+// createKnownKeys is the set of TOP-LEVEL container-create keys this guard has
+// reasoned about. Anything else is denied. See validateHostConfigKeys for why
+// the policy is inverted this way.
+//
+// None of these can reach the host on their own: they configure the process
+// inside the container. Host access is a HostConfig concern.
+var createKnownKeys = map[string]bool{
+	"Image":      true, // checked against the image allowlist
+	"HostConfig": true, // checked field by field, below
+	"Entrypoint": true, // checked when infra digest trust is in play
+	"Cmd":        true, // checked when infra digest trust is in play
+
+	// Container-internal process configuration. Every one of these is
+	// confined to the container's own namespaces.
+	"Hostname":     true, // container's own hostname
+	"Domainname":   true, // container's own domain
+	"User":         true, // uid/gid inside the container
+	"AttachStdin":  true, // stream plumbing
+	"AttachStdout": true, // stream plumbing
+	"AttachStderr": true, // stream plumbing
+	"Tty":          true, // stream plumbing
+	"OpenStdin":    true, // stream plumbing
+	"StdinOnce":    true, // stream plumbing
+	"Env":          true, // environment of the container process
+	"Labels":       true, // metadata only
+	"WorkingDir":   true, // path inside the container
+	"Healthcheck":  true, // a command run inside the container
+	"ArgsEscaped":  true, // Windows arg quoting flag
+	"StopSignal":   true, // signal name
+	"StopTimeout":  true, // seconds
+	"Shell":        true, // shell for the image's SHELL form
+	"OnBuild":      true, // build metadata, inert at run time
+	"ExposedPorts": true, // metadata; actual publishing is HostConfig.PortBindings
+
+	// Anonymous volumes: Docker-managed, created under
+	// /var/lib/docker/volumes. No caller-supplied host path.
+	"Volumes": true,
+
+	// Deprecated container-level MAC address (moved into NetworkingConfig).
+	"MacAddress":      true,
+	"NetworkDisabled": true,
+
+	// Per-endpoint network settings (aliases, static IPs, driver opts).
+	// Note this does NOT gate WHICH network is joined: that is
+	// HostConfig.NetworkMode, which is checked only for the host/container:
+	// forms, so joining another project's user-defined network is a
+	// pre-existing residual of this guard, unchanged here.
+	"NetworkingConfig": true,
+}
+
+// hostConfigKnownKeys is the set of HostConfig keys this guard has reasoned
+// about. A key that is not here causes a DENY.
+//
+// This inversion is the point. The guard used to enumerate the DANGEROUS
+// HostConfig fields and deny those, which meant every field it had not heard
+// of was silently permitted. The same host escape was then found six separate
+// times on this branch (Binds; HostConfig.Mounts read from the wrong struct
+// level; a Type:"volume" inline driver bind; a named-volume bind;
+// MaskedPaths/ReadonlyPaths; DeviceCgroupRules) — each one found only after
+// the previous had been closed. The rule is now "a create body may only
+// contain fields we have reasoned about", so a field added by a future Docker
+// API version is denied until someone reasons about it.
+//
+// Every entry below carries the reason it is here. Entries marked "checked"
+// have an explicit value check in validateContainerCreate; the rest are
+// permitted as sent.
+//
+// Note that the Docker CLI marshals the WHOLE HostConfig struct, zero values
+// included (verified against docker 29.7.2: a bare `docker create alpine`
+// sends 62 HostConfig keys). So this list must cover the benign ones or every
+// ordinary docker run would be denied; presence of a key is not itself a
+// signal, which is why the dangerous ones are checked by VALUE.
+var hostConfigKnownKeys = map[string]bool{
+	// --- checked by value in validateContainerCreate ---
+	"Binds":             true, // host paths, checked against the volume allowlist
+	"Mounts":            true, // default-deny on mount Type; bind sources checked
+	"Privileged":        true, // denied except for a digest-pinned infra image
+	"PidMode":           true, // host/container: forms denied
+	"NetworkMode":       true, // host/container: forms denied
+	"UsernsMode":        true, // host denied
+	"IpcMode":           true, // host/container: forms denied
+	"CgroupnsMode":      true, // host denied
+	"UTSMode":           true, // host denied
+	"CapAdd":            true, // any added capability denied
+	"Devices":           true, // any host device mapping denied
+	"DeviceCgroupRules": true, // denied: raw block-device access (CAP_MKNOD is a default cap)
+	"DeviceRequests":    true, // denied: device passthrough (GPUs) by another name
+	"VolumesFrom":       true, // denied: inherits another container's mounts
+	"SecurityOpt":       true, // denied: seccomp/apparmor/no-new-privileges tampering
+	"MaskedPaths":       true, // denied when non-null: empties the /proc mask set
+	"ReadonlyPaths":     true, // denied when non-null: empties the /proc read-only set
+	"ContainerIDFile":   true, // denied when non-empty: a host path the daemon writes to
+	"Cgroup":            true, // denied when non-empty: CgroupSpec takes a container:<id> form
+	"CgroupParent":      true, // denied when non-empty: places the container in an arbitrary cgroup
+	"VolumeDriver":      true, // denied when non-empty: selects a third-party volume plugin
+	"Links":             true, // denied when non-empty: legacy wiring to another project's container
+	"LogConfig":         true, // driver Type restricted; see logDriverAllowed
+
+	// --- permitted as sent ---
+
+	// Restrictions, not powers: these can only reduce what the container may do.
+	"CapDrop":        true, // drops capabilities
+	"ReadonlyRootfs": true, // read-only container rootfs
+
+	// Resource limits. Cgroup accounting only; they grant no access to
+	// anything outside the container.
+	"CpuShares":          true,
+	"Memory":             true,
+	"NanoCpus":           true,
+	"CpuPeriod":          true,
+	"CpuQuota":           true,
+	"CpuRealtimePeriod":  true,
+	"CpuRealtimeRuntime": true,
+	"CpusetCpus":         true,
+	"CpusetMems":         true,
+	"CpuCount":           true,
+	"CpuPercent":         true,
+	"MemoryReservation":  true,
+	"MemorySwap":         true,
+	"MemorySwappiness":   true,
+	"OomKillDisable":     true,
+	"OomScoreAdj":        true, // daemon clamps this to the -1000..1000 range
+	"PidsLimit":          true,
+	"Ulimits":            true,
+	"ShmSize":            true,
+	"IOMaximumIOps":      true,
+	"IOMaximumBandwidth": true,
+	// Blkio throttling. The *Device variants name a host device, but only to
+	// rate-limit it; they confer no access to it (Devices/DeviceCgroupRules
+	// are what would, and both are denied).
+	"BlkioWeight":          true,
+	"BlkioWeightDevice":    true,
+	"BlkioDeviceReadBps":   true,
+	"BlkioDeviceWriteBps":  true,
+	"BlkioDeviceReadIOps":  true,
+	"BlkioDeviceWriteIOps": true,
+
+	// Lifecycle and stream plumbing.
+	"AutoRemove":    true, // docker run --rm
+	"RestartPolicy": true, // restart on failure
+	"ConsoleSize":   true, // tty dimensions
+	"Init":          true, // run tini as pid 1
+
+	// Networking exposed to the container. Publishing a host port is a real
+	// (accepted) power: it can occupy a port on the host's network stack.
+	// It cannot read or write the host filesystem, and the container can
+	// reach the network regardless, so it is permitted as the product needs
+	// it for ordinary compose work.
+	"PortBindings":    true,
+	"PublishAllPorts": true,
+	"ExtraHosts":      true, // /etc/hosts entries inside the container
+	"Dns":             true, // resolver config inside the container
+	"DnsOptions":      true,
+	"DnsSearch":       true,
+
+	// Supplementary GIDs for the container process. Only meaningful against
+	// files the container can already see; the docker socket cannot be
+	// mounted (IsVolumePathAllowed denies it unconditionally).
+	"GroupAdd": true,
+
+	// In-container tmpfs mounts. No host source, same reasoning as the
+	// Type:"tmpfs" arm of the Mounts switch.
+	"Tmpfs": true,
+
+	// Windows-only container isolation mode; inert on Linux.
+	"Isolation": true,
+
+	// Deliberately ABSENT, and therefore denied: Sysctls (kernel knobs),
+	// Runtime (selects an alternative OCI runtime), StorageOpt (graph driver
+	// options), Annotations (steers runtime plugins), KernelMemoryTCP and
+	// KernelMemory (deprecated), Capabilities (whole-set replacement),
+	// Ulimits aside every other field a future API version adds. None of
+	// these are needed for project work through this guard; if one turns out
+	// to be, add it here WITH the reasoning, not silently.
+}
+
+// logDriverAllowed are the logging drivers HostConfig.LogConfig may select.
+// The remaining drivers (syslog, fluentd, gelf, splunk, awslogs, ...) take an
+// address option, which makes the DAEMON connect somewhere of the caller's
+// choosing — including a unix socket path on the host — and stream data to it.
+// Nothing in project work needs that.
+var logDriverAllowed = map[string]bool{
+	"":          true, // the daemon's configured default; what the CLI sends
+	"json-file": true,
+	"local":     true,
+	"journald":  true,
+	"none":      true,
 }
 
 // execCreateRequest is the subset of fields we inspect from exec create.
@@ -160,7 +381,7 @@ func (v *Validator) Validate(r *http.Request) Decision {
 		return v.validateNetworkCreate(r)
 
 	case ReContainerAttach.MatchString(path):
-		return v.validateContainerAccess(path, ReContainerAttach, "attach")
+		return v.validateContainerSession(path, ReContainerAttach, "attach")
 
 	case ReContainerWait.MatchString(path):
 		return v.validateContainerAccess(path, ReContainerWait, "wait")
@@ -180,6 +401,12 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	bodyBytes, err := readBody(r)
 	if err != nil {
 		return deny(fmt.Sprintf("failed to read request body: %v", err))
+	}
+
+	// Unknown fields fail CLOSED. This runs before any other check, so a
+	// field nobody has reasoned about cannot reach the daemon at all.
+	if d := checkKnownKeys(bodyBytes); d != nil {
+		return *d
 	}
 
 	var req containerCreateRequest
@@ -244,9 +471,23 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 		}
 	}
 
-	// Check privileged mode
-	if req.HostConfig.Privileged && !infraImage {
-		return deny("privileged containers are not allowed")
+	// Check privileged mode.
+	//
+	// Infra digest trust pins the image's CONTENT, never the COMMAND: the
+	// caller still supplies Entrypoint and Cmd. Without the check below,
+	// {"Image":"moby/buildkit@sha256:<pinned>","Entrypoint":["/bin/sh","-c",…],
+	// "HostConfig":{"Privileged":true}} was allowed — the legitimate image
+	// running arbitrary code as root in a privileged container, which is
+	// exactly what this guard exists to prevent. The digest is not a secret
+	// either: GET /images/json is a global read and returns RepoDigests.
+	// So the relaxation applies only to the image's OWN entrypoint.
+	if req.HostConfig.Privileged {
+		if !infraImage {
+			return deny("privileged containers are not allowed")
+		}
+		if !isEmptyJSON(req.Entrypoint) || !isEmptyJSON(req.Cmd) {
+			return deny("a privileged infra image must run its own entrypoint: Entrypoint and Cmd must be absent")
+		}
 	}
 
 	// Check PidMode. "host" joins the host pid namespace directly; a
@@ -306,7 +547,122 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 		return deny("SecurityOpt is not allowed")
 	}
 
+	// Check MaskedPaths / ReadonlyPaths. Non-nil (i.e. the key was sent as
+	// anything other than null) is the deny condition, empty array included —
+	// an empty array is precisely the attack, because it REPLACES the
+	// daemon's default /proc masks with nothing. `docker run --security-opt
+	// systempaths=unconfined` produces it client-side, together with an
+	// EMPTY SecurityOpt, so the check above cannot see it. Verified against
+	// docker 29.7.2: with these emptied, /proc/sys is writable
+	// (/proc/sys/kernel/core_pattern is host-global) and /proc/kcore is the
+	// real kcore. No caller has a legitimate reason to shrink the mask set
+	// through this guard.
+	if req.HostConfig.MaskedPaths != nil {
+		return deny("MaskedPaths is not allowed: it replaces the daemon's default /proc masks")
+	}
+	if req.HostConfig.ReadonlyPaths != nil {
+		return deny("ReadonlyPaths is not allowed: it replaces the daemon's default /proc read-only set")
+	}
+
+	// Check DeviceCgroupRules. Devices (above) is denied, but the device
+	// cgroup is the only thing standing between a container and raw block
+	// devices: CAP_MKNOD is in Docker's DEFAULT capability set, so a rule
+	// like "b 8:* rwm" plus mknod is enough to read the host's disks.
+	// Verified against docker 29.7.2 with Devices=[] and CapAdd=[], so
+	// neither existing check fires.
+	if len(req.HostConfig.DeviceCgroupRules) > 0 {
+		return deny("DeviceCgroupRules is not allowed: it grants raw host device access")
+	}
+
+	// DeviceRequests is device passthrough under another name (it is how
+	// --gpus is expressed).
+	if len(req.HostConfig.DeviceRequests) > 0 {
+		return deny("DeviceRequests is not allowed: device passthrough")
+	}
+
+	// ContainerIDFile is a HOST path the daemon writes the container ID into.
+	if req.HostConfig.ContainerIDFile != "" {
+		return deny("ContainerIDFile is not allowed: the daemon would write to a caller-chosen host path")
+	}
+
+	// Cgroup is a CgroupSpec and takes a "container:<id>" form, i.e. another
+	// container's cgroup — the same pivot shape the namespace fields have.
+	if req.HostConfig.Cgroup != "" {
+		return deny("Cgroup is not allowed")
+	}
+
+	// CgroupParent places the container under an arbitrary cgroup path.
+	if req.HostConfig.CgroupParent != "" {
+		return deny("CgroupParent is not allowed")
+	}
+
+	// VolumeDriver selects a third-party volume plugin for the container's
+	// volumes, which is a mount source this guard cannot reason about.
+	if req.HostConfig.VolumeDriver != "" {
+		return deny("VolumeDriver is not allowed")
+	}
+
+	// Links is legacy wiring into another (possibly another project's)
+	// container, by name.
+	if len(req.HostConfig.Links) > 0 {
+		return deny("Links is not allowed")
+	}
+
+	// A logging driver that takes an address makes the DAEMON connect to a
+	// caller-chosen endpoint, host unix sockets included, and stream to it.
+	if !logDriverAllowed[req.HostConfig.LogConfig.Type] {
+		return deny(fmt.Sprintf("log driver %q is not allowed", req.HostConfig.LogConfig.Type))
+	}
+
 	return allow("container create allowed")
+}
+
+// isEmptyJSON reports whether a RawMessage is absent or carries no content:
+// missing, null, an empty array, or an empty string. Entrypoint and Cmd may
+// each be either a string or a string array in the Docker API.
+func isEmptyJSON(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return s == "" || s == "null" || s == "[]" || s == `""`
+}
+
+// checkKnownKeys enforces the fail-closed field policy on a container-create
+// body: every top-level key must be in createKnownKeys and every HostConfig
+// key must be in hostConfigKnownKeys. A key that is on neither list is denied,
+// so a Docker API field this guard has never reasoned about cannot be used
+// until someone adds it to a list along with the reason.
+//
+// Returns nil when the body is acceptable, or a deny Decision to return.
+func checkKnownKeys(bodyBytes []byte) *Decision {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(bodyBytes, &top); err != nil {
+		d := deny(fmt.Sprintf("failed to parse request body: %v", err))
+		return &d
+	}
+	for key := range top {
+		if !createKnownKeys[key] {
+			d := deny(fmt.Sprintf("container create field %q is not permitted: "+
+				"this guard denies fields it has not reasoned about", key))
+			return &d
+		}
+	}
+
+	raw, ok := top["HostConfig"]
+	if !ok || string(raw) == "null" {
+		return nil
+	}
+	var hc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &hc); err != nil {
+		d := deny(fmt.Sprintf("failed to parse HostConfig: %v", err))
+		return &d
+	}
+	for key := range hc {
+		if !hostConfigKnownKeys[key] {
+			d := deny(fmt.Sprintf("HostConfig field %q is not permitted: "+
+				"this guard denies fields it has not reasoned about", key))
+			return &d
+		}
+	}
+	return nil
 }
 
 // checkContainerUsable returns a non-nil deny Decision if containerID may
@@ -322,6 +678,23 @@ func (v *Validator) checkContainerUsable(containerID string) *Decision {
 	}
 	if v.config.IsReadOnly() && v.tracker.IsPreowned(containerID) {
 		d := deny(fmt.Sprintf("container %q is Docker infrastructure and read-only mode blocks all actions on it", containerID))
+		return &d
+	}
+	return nil
+}
+
+// checkNotPreowned returns a deny Decision if containerID was seeded
+// host-side. Seeded containers are Docker's own infrastructure — in practice
+// the buildkit builder, which RUNS PRIVILEGED. Seeding exists so the session
+// can manage that container's lifecycle (start/stop/inspect), not so it can
+// get a shell inside it: `docker exec buildx_buildkit_default sh` is root in
+// a privileged container, which is a host escape with no create call at all.
+// A privileged exec BODY is already denied, but the CONTAINER's privilege is
+// what matters here, so the route itself is closed in EVERY mode.
+func (v *Validator) checkNotPreowned(containerID, operation string) *Decision {
+	if v.tracker.IsPreowned(containerID) {
+		d := deny(fmt.Sprintf("container %q was seeded host-side (Docker infrastructure); %s into it is not allowed",
+			containerID, operation))
 		return &d
 	}
 	return nil
@@ -364,6 +737,9 @@ func (v *Validator) validateContainerExec(r *http.Request) Decision {
 	containerID := matches[2]
 
 	if d := v.checkContainerUsable(containerID); d != nil {
+		return *d
+	}
+	if d := v.checkNotPreowned(containerID, "exec"); d != nil {
 		return *d
 	}
 
@@ -626,4 +1002,20 @@ func (v *Validator) validateContainerAccess(path string, re *regexp.Regexp, oper
 	}
 
 	return allow(fmt.Sprintf("container %s allowed", operation))
+}
+
+// validateContainerSession is validateContainerAccess plus the seeded-container
+// rule: routes that hand the caller a shell or a stdio stream INSIDE the
+// container (exec, attach) are denied on host-seeded infrastructure
+// containers, because those run privileged. Lifecycle and read routes keep
+// using validateContainerAccess.
+func (v *Validator) validateContainerSession(path string, re *regexp.Regexp, operation string) Decision {
+	matches := re.FindStringSubmatch(path)
+	if matches == nil {
+		return deny("operation not allowed")
+	}
+	if d := v.checkNotPreowned(matches[2], operation); d != nil {
+		return *d
+	}
+	return v.validateContainerAccess(path, re, operation)
 }

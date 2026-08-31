@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strings"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/vossi/bw-docker-guard/internal/config"

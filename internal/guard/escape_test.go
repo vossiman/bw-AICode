@@ -16,8 +16,13 @@ import (
 //	2. NormalizeImageName stripped tag AND digest, so the minted name matched
 //	   the infra allowlist.
 //	3. validateContainerCreate returned allow on an infra match BEFORE it
-//	   looked at Binds, Mounts, Privileged, namespaces, CapAdd, Devices,
-//	   VolumesFrom or SecurityOpt.
+//	   looked at any HostConfig field at all. The fields named in the spec
+//	   were Binds, Mounts, Privileged, the namespace modes, CapAdd, Devices,
+//	   VolumesFrom and SecurityOpt — that was the field set KNOWN AT THE TIME,
+//	   not a complete one, and treating it as complete is what let the same
+//	   host escape be re-found five more times (see the fail-closed field
+//	   policy in validator.go). The authoritative list is now
+//	   hostConfigKnownKeys; anything absent from it is denied.
 //	4. Start and exec needed no bypass at all: the container was genuinely
 //	   session-owned by then.
 //
@@ -202,7 +207,10 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 	t.Run("link2_positive_the_exact_pinned_digest_IS_infra", func(t *testing.T) {
 		// Positive control. Every deny above is vacuous if the fixture digest
 		// never matched anything. This also pins the one relaxation infra
-		// trust actually buys: Privileged, which buildkit genuinely needs.
+		// trust actually buys: Privileged for the image's OWN entrypoint,
+		// which buildkit genuinely needs. A caller-supplied command under the
+		// same privilege is a separate matter and is denied — see
+		// infra_privilege_does_not_extend_to_a_caller_supplied_command below.
 		ref := "moby/buildkit@" + escapeDigest
 		if !cfg.IsInfraImage(ref) {
 			t.Fatalf("fixture broken: %q is not recognised as infra, so the deny cases above prove nothing", ref)
@@ -210,6 +218,211 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 		body := `{"Image": "` + ref + `", "HostConfig": {"Privileged": true}}`
 		if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); !d.Allow {
 			t.Fatalf("regression: real infra image cannot run privileged: %s", d.Reason)
+		}
+	})
+
+	// ---------------------------------------------------------------
+	// The fail-closed field policy, and the four fields whose absence from
+	// the old enumerate-the-dangerous-ones model made them escapes.
+	// ---------------------------------------------------------------
+
+	t.Run("unknown_create_fields_fail_closed", func(t *testing.T) {
+		// Guards: checkKnownKeys. This is the STRUCTURAL fix. The guard used
+		// to deny an enumerated set of dangerous HostConfig fields, which
+		// meant every field it had not heard of was permitted — the same host
+		// escape was found six times that way. A create body may now only
+		// carry fields that appear in createKnownKeys / hostConfigKnownKeys.
+		//
+		// The cases below are real Docker API fields that this guard has
+		// deliberately NOT reasoned about, plus an invented one standing in
+		// for whatever a future API version adds.
+		cases := []struct{ name, body string }{
+			{"Sysctls", createBody(`{"Sysctls": {"kernel.shmmax": "1"}}`)},
+			{"Runtime", createBody(`{"Runtime": "sysbox-runc"}`)},
+			{"StorageOpt", createBody(`{"StorageOpt": {"size": "10G"}}`)},
+			{"Annotations", createBody(`{"Annotations": {"a": "b"}}`)},
+			{"KernelMemoryTCP", createBody(`{"KernelMemoryTCP": 1}`)},
+			{"Capabilities (whole-set replacement)", createBody(`{"Capabilities": ["CAP_SYS_ADMIN"]}`)},
+			{"an invented future field", createBody(`{"HostEscapeHatch2027": true}`)},
+			{"an unknown TOP-LEVEL field", `{"Image": "postgres:16", "Mounts": [{"Type": "bind", "Source": "/", "Target": "/host"}]}`},
+			{"another invented top-level field", `{"Image": "postgres:16", "FutureRootAccess": true}`},
+		}
+		for _, tc := range cases {
+			d := v.Validate(makeRequest("POST", "/v1.45/containers/create", tc.body))
+			if d.Allow {
+				t.Errorf("fail-closed policy open: %s was silently permitted", tc.name)
+			}
+			if !strings.Contains(d.Reason, "not permitted") {
+				t.Errorf("%s: denied for the wrong reason (%s); the field policy should be what rejects it", tc.name, d.Reason)
+			}
+		}
+	})
+
+	t.Run("c1_MaskedPaths_and_ReadonlyPaths_are_denied", func(t *testing.T) {
+		// CRITICAL 1. `docker run --security-opt systempaths=unconfined` is
+		// translated CLIENT-SIDE into MaskedPaths: [] and ReadonlyPaths: [],
+		// and sends SecurityOpt as an EMPTY array — so the SecurityOpt check
+		// looks like it covers this and does not. An empty array is not
+		// "nothing": it REPLACES the daemon's defaults, unmasking /proc/kcore
+		// and making /proc/sys writable, and /proc/sys/kernel/core_pattern is
+		// host-global (verified live on docker 29.7.2: the probe write
+		// succeeds where a control run gets "Read-only file system").
+		//
+		// This needed only an ALLOWLISTED image: no build, no digest, no
+		// infra trust. Hence createBody(), which uses postgres:16.
+		cases := []struct{ name, hostConfig string }{
+			{"the CLI's exact systempaths=unconfined shape",
+				`{"MaskedPaths": [], "ReadonlyPaths": [], "SecurityOpt": []}`},
+			{"MaskedPaths emptied alone", `{"MaskedPaths": []}`},
+			{"ReadonlyPaths emptied alone", `{"ReadonlyPaths": []}`},
+			{"MaskedPaths shrunk rather than emptied", `{"MaskedPaths": ["/proc/kcore"]}`},
+			{"ReadonlyPaths shrunk rather than emptied", `{"ReadonlyPaths": ["/proc/asound"]}`},
+		}
+		for _, tc := range cases {
+			if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", createBody(tc.hostConfig))); d.Allow {
+				t.Errorf("CRITICAL 1 open: %s allowed", tc.name)
+			}
+		}
+		// Positive control: null is what EVERY ordinary docker run sends, and
+		// it means "daemon defaults apply". It must stay allowed, otherwise
+		// the denies above would be passing by breaking all container creates.
+		if d := v.Validate(makeRequest("POST", "/v1.45/containers/create",
+			createBody(`{"MaskedPaths": null, "ReadonlyPaths": null}`))); !d.Allow {
+			t.Errorf("regression: null MaskedPaths/ReadonlyPaths (the normal case) denied: %s", d.Reason)
+		}
+	})
+
+	t.Run("c2_DeviceCgroupRules_is_denied", func(t *testing.T) {
+		// CRITICAL 2. Devices is denied, but the device cgroup is the only
+		// barrier left: CAP_MKNOD is in Docker's DEFAULT capability set, so
+		// a rule plus mknod reaches raw host block devices. Verified live:
+		// --device-cgroup-rule='b 8:* rwm', then mknod, then reading raw
+		// sectors, all succeeded — with Devices=[] and CapAdd=[], so neither
+		// existing check fired.
+		for _, rule := range []string{`"b 8:* rwm"`, `"c *:* rwm"`, `"a *:* rwm"`} {
+			body := createBody(`{"DeviceCgroupRules": [` + rule + `], "Devices": [], "CapAdd": []}`)
+			if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); d.Allow {
+				t.Errorf("CRITICAL 2 open: DeviceCgroupRules %s allowed", rule)
+			}
+		}
+		// DeviceRequests is the same power under another name (it is how
+		// --gpus is expressed), and was equally unchecked.
+		body := createBody(`{"DeviceRequests": [{"Driver": "", "Count": -1, "Capabilities": [["gpu"]]}]}`)
+		if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); d.Allow {
+			t.Error("CRITICAL 2 open: DeviceRequests allowed")
+		}
+		// Positive control: null/empty is the normal case and must pass.
+		if d := v.Validate(makeRequest("POST", "/v1.45/containers/create",
+			createBody(`{"DeviceCgroupRules": null, "DeviceRequests": null}`))); !d.Allow {
+			t.Errorf("regression: null DeviceCgroupRules/DeviceRequests denied: %s", d.Reason)
+		}
+	})
+
+	t.Run("c3_infra_privilege_does_not_extend_to_a_caller_supplied_command", func(t *testing.T) {
+		// CRITICAL 3. The digest pins the image's CONTENT; the caller still
+		// supplies the COMMAND. So the legitimate buildkit image could be
+		// made to run /bin/sh -c … as root in a privileged container — the
+		// exact outcome this branch exists to prevent, reached with a public
+		// registry digest that GET /images/json hands out for free.
+		infraRef := "moby/buildkit@" + escapeDigest
+		for _, tc := range []struct{ name, extra string }{
+			{"Entrypoint", `"Entrypoint": ["/bin/sh", "-c", "cat /host/etc/shadow"]`},
+			{"Entrypoint as a bare string", `"Entrypoint": "/bin/sh"`},
+			{"Cmd", `"Cmd": ["/bin/sh", "-c", "id"]`},
+			{"Cmd as a bare string", `"Cmd": "/bin/sh"`},
+			{"both", `"Entrypoint": ["/bin/sh"], "Cmd": ["-c", "id"]`},
+		} {
+			body := `{"Image": "` + infraRef + `", ` + tc.extra + `, "HostConfig": {"Privileged": true}}`
+			if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); d.Allow {
+				t.Errorf("CRITICAL 3 open: privileged infra create with a caller-supplied %s allowed", tc.name)
+			}
+		}
+		// The same command WITHOUT the privilege relaxation is still denied,
+		// because the image is not allowlisted for ordinary use...
+		body := `{"Image": "` + infraRef + `", "Cmd": ["/bin/sh"], "HostConfig": {"Privileged": true, "Binds": ["/:/host"]}}`
+		if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); d.Allow {
+			t.Error("CRITICAL 3 open: privileged infra create with a command and a host bind allowed")
+		}
+		// ...and an allowlisted, unprivileged image may of course carry a
+		// command. Without this control the denies above could be passing
+		// because Cmd is rejected outright, which would break every create.
+		if d := v.Validate(makeRequest("POST", "/v1.45/containers/create",
+			`{"Image": "postgres:16", "Cmd": ["postgres", "-c", "fsync=off"], "Entrypoint": ["/entry.sh"], "HostConfig": {}}`)); !d.Allow {
+			t.Errorf("regression: an ordinary create with Entrypoint/Cmd denied: %s", d.Reason)
+		}
+		// And the empty spellings the API actually sends must not be read as
+		// "a command was supplied".
+		for _, empty := range []string{`"Cmd": null, "Entrypoint": null`, `"Cmd": [], "Entrypoint": []`, `"Cmd": "", "Entrypoint": ""`} {
+			body := `{"Image": "` + infraRef + `", ` + empty + `, "HostConfig": {"Privileged": true}}`
+			if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); !d.Allow {
+				t.Errorf("regression: infra create with an empty command (%s) denied: %s", empty, d.Reason)
+			}
+		}
+	})
+
+	t.Run("c4_exec_and_attach_on_a_seeded_container_are_denied", func(t *testing.T) {
+		// CRITICAL 4. A privileged exec BODY is denied, but the seeded
+		// buildkit CONTAINER is itself privileged, so an ordinary
+		// `docker exec buildx_buildkit_default sh` is root in a privileged
+		// container. Seeding exists to let the session manage that
+		// container's lifecycle, not to get a shell inside it — so the exec
+		// and attach routes are closed on pre-owned containers in ALL modes,
+		// not just read-only.
+		for _, id := range []string{"buildx_buildkit_default", seededFullID, seededFullID[:12], seededHexName} {
+			for _, suffix := range []string{"exec", "attach"} {
+				r := makeRequest("POST", "/v1.45/containers/"+id+"/"+suffix, `{}`)
+				if d := v.Validate(r); d.Allow {
+					t.Errorf("CRITICAL 4 open: %s on seeded container %q allowed", suffix, id)
+				}
+			}
+		}
+		// Positive control: lifecycle and read actions on a seeded container
+		// must still work, or the fix has just broken buildkit management
+		// (and every deny above would be vacuous).
+		for _, path := range []string{
+			"/v1.45/containers/" + seededFullID + "/start",
+			"/v1.45/containers/" + seededFullID + "/stop",
+			"/v1.45/containers/" + seededFullID + "/wait",
+		} {
+			if d := v.Validate(makeRequest("POST", path, `{}`)); !d.Allow {
+				t.Errorf("regression: %s on a seeded container denied: %s", path, d.Reason)
+			}
+		}
+		if d := v.Validate(makeRequest("GET", "/v1.45/containers/"+seededFullID+"/json", "")); !d.Allow {
+			t.Errorf("regression: inspect of a seeded container denied: %s", d.Reason)
+		}
+		// And exec on an ordinary owned container is unaffected.
+		_, ownedTracker, ov := escapeValidator()
+		ownedTracker.Add("11111111111111111111111111111111111111111111111111111111111111ff")
+		if d := ov.Validate(makeRequest("POST",
+			"/v1.45/containers/11111111111111111111111111111111111111111111111111111111111111ff/exec", `{}`)); !d.Allow {
+			t.Errorf("regression: exec on a session-created container denied: %s", d.Reason)
+		}
+	})
+
+	t.Run("positive_real_docker_cli_and_compose_bodies_are_allowed", func(t *testing.T) {
+		// The fail-closed field policy is only safe if it lets real callers
+		// through, and the Docker CLI marshals the WHOLE HostConfig struct —
+		// 62 keys, zero values included — on every create. Both bodies below
+		// were captured verbatim from docker 29.7.2 through a logging proxy
+		// (a `docker create` with ports, env, a bind, --tmpfs, --init,
+		// --memory and a healthcheck; and a `docker compose create`). If a
+		// future Docker version adds a HostConfig field, THIS is the test
+		// that goes red, which is the intended trade: a denied create the
+		// day the CLI changes, rather than a silently permitted escape.
+		realCfg := &config.Config{
+			ProjectDir:      "/tmp",
+			AllowedImages:   []string{"alpine:latest"},
+			VolumeMountRoot: "/tmp",
+		}
+		rv := NewValidator(realCfg, ownership.New())
+		for name, body := range map[string]string{
+			"docker cli":     realDockerCLIBody,
+			"docker compose": realDockerComposeBody,
+		} {
+			if d := rv.Validate(makeRequest("POST", "/v1.45/containers/create", body)); !d.Allow {
+				t.Errorf("regression: a real %s container-create body was denied: %s", name, d.Reason)
+			}
 		}
 	})
 
@@ -700,3 +913,22 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 		}
 	})
 }
+
+// realDockerCLIBody and realDockerComposeBody are VERBATIM container-create
+// bodies captured from docker 29.7.2 through a logging unix-socket proxy.
+// They are fixtures for the fail-closed field policy: the CLI marshals the
+// entire HostConfig struct, zero values included, so the known-key lists in
+// validator.go have to cover every benign field or ordinary work breaks.
+//
+// realDockerCLIBody is:
+//
+//	docker create -p 8080:80 -e FOO=bar --rm -v /tmp/x:/data --tmpfs /run \
+//	  --memory 64m --init --health-cmd true alpine:latest sleep 1
+//
+// realDockerComposeBody is `docker compose create` for a one-service file with
+// ports, a relative bind, environment and a json-file logging driver.
+//
+// Do not hand-edit these. Re-capture them if the fixture needs to change.
+const realDockerCLIBody = `{"Hostname":"","Domainname":"","User":"","AttachStdin":false,"AttachStdout":true,"AttachStderr":true,"ExposedPorts":{"80/tcp":{}},"Tty":false,"OpenStdin":false,"StdinOnce":false,"Env":["FOO=bar"],"Cmd":["sleep","1"],"Healthcheck":{"Test":["CMD-SHELL","true"]},"Image":"alpine:latest","Volumes":{},"WorkingDir":"","Entrypoint":null,"Labels":{},"HostConfig":{"Binds":["/tmp/x:/data"],"ContainerIDFile":"","LogConfig":{"Type":"","Config":{}},"NetworkMode":"default","PortBindings":{"80/tcp":[{"HostIp":"","HostPort":"8080"}]},"RestartPolicy":{"Name":"no","MaximumRetryCount":0},"AutoRemove":true,"VolumeDriver":"","VolumesFrom":null,"ConsoleSize":[0,0],"CapAdd":null,"CapDrop":null,"CgroupnsMode":"","Dns":null,"DnsOptions":[],"DnsSearch":[],"ExtraHosts":null,"GroupAdd":null,"IpcMode":"","Cgroup":"","Links":null,"OomScoreAdj":0,"PidMode":"","Privileged":false,"PublishAllPorts":false,"ReadonlyRootfs":false,"SecurityOpt":null,"Tmpfs":{"/run":""},"UTSMode":"","UsernsMode":"","ShmSize":0,"Isolation":"","CpuShares":0,"Memory":67108864,"NanoCpus":0,"CgroupParent":"","BlkioWeight":0,"BlkioWeightDevice":[],"BlkioDeviceReadBps":[],"BlkioDeviceWriteBps":[],"BlkioDeviceReadIOps":[],"BlkioDeviceWriteIOps":[],"CpuPeriod":0,"CpuQuota":0,"CpuRealtimePeriod":0,"CpuRealtimeRuntime":0,"CpusetCpus":"","CpusetMems":"","Devices":[],"DeviceCgroupRules":null,"DeviceRequests":null,"MemoryReservation":0,"MemorySwap":0,"MemorySwappiness":-1,"OomKillDisable":false,"PidsLimit":0,"Ulimits":[],"CpuCount":0,"CpuPercent":0,"IOMaximumIOps":0,"IOMaximumBandwidth":0,"MaskedPaths":null,"ReadonlyPaths":null,"Init":true},"NetworkingConfig":{"EndpointsConfig":{"default":{"IPAMConfig":null,"Links":null,"Aliases":null,"DriverOpts":null,"GwPriority":0,"NetworkID":"","EndpointID":"","Gateway":"","IPAddress":"","MacAddress":"","IPPrefixLen":0,"IPv6Gateway":"","GlobalIPv6Address":"","GlobalIPv6PrefixLen":0,"DNSNames":null}}}}`
+
+const realDockerComposeBody = `{"Hostname":"","Domainname":"","User":"","AttachStdin":false,"AttachStdout":true,"AttachStderr":true,"ExposedPorts":{"80/tcp":{}},"Tty":false,"OpenStdin":false,"StdinOnce":false,"Env":["A=b"],"Cmd":["sleep","1"],"Image":"alpine:latest","Volumes":null,"WorkingDir":"","Entrypoint":null,"OnBuild":null,"Labels":{"com.docker.compose.config-hash":"5fc888cf79f22caf89323474b41a05ba8fda00d04815823b1c9caa843452efe2","com.docker.compose.container-number":"1","com.docker.compose.depends_on":"","com.docker.compose.image":"sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b","com.docker.compose.oneoff":"False","com.docker.compose.project":"capcomp","com.docker.compose.project.config_files":"/tmp/capcomp/compose.yaml","com.docker.compose.project.working_dir":"/tmp/capcomp","com.docker.compose.service":"app","com.docker.compose.version":"2.40.3"},"HostConfig":{"Binds":["/tmp/capcomp/d:/d:rw"],"ContainerIDFile":"","LogConfig":{"Type":"json-file","Config":null},"NetworkMode":"capcomp_default","PortBindings":{"80/tcp":[{"HostIp":"","HostPort":"8081"}]},"RestartPolicy":{"Name":"","MaximumRetryCount":0},"AutoRemove":false,"VolumeDriver":"","VolumesFrom":null,"ConsoleSize":[0,0],"CapAdd":null,"CapDrop":null,"CgroupnsMode":"","Dns":null,"DnsOptions":null,"DnsSearch":null,"ExtraHosts":[],"GroupAdd":null,"IpcMode":"","Cgroup":"","Links":null,"OomScoreAdj":0,"PidMode":"","Privileged":false,"PublishAllPorts":false,"ReadonlyRootfs":false,"SecurityOpt":null,"UTSMode":"","UsernsMode":"","ShmSize":0,"Isolation":"","CpuShares":0,"Memory":0,"NanoCpus":0,"CgroupParent":"","BlkioWeight":0,"BlkioWeightDevice":null,"BlkioDeviceReadBps":null,"BlkioDeviceWriteBps":null,"BlkioDeviceReadIOps":null,"BlkioDeviceWriteIOps":null,"CpuPeriod":0,"CpuQuota":0,"CpuRealtimePeriod":0,"CpuRealtimeRuntime":0,"CpusetCpus":"","CpusetMems":"","Devices":null,"DeviceCgroupRules":null,"DeviceRequests":null,"MemoryReservation":0,"MemorySwap":0,"MemorySwappiness":null,"OomKillDisable":false,"PidsLimit":null,"Ulimits":null,"CpuCount":0,"CpuPercent":0,"IOMaximumIOps":0,"IOMaximumBandwidth":0,"MaskedPaths":null,"ReadonlyPaths":null},"NetworkingConfig":{"EndpointsConfig":{"capcomp_default":{"IPAMConfig":null,"Links":null,"Aliases":["capcomp-app-1","app"],"MacAddress":"","DriverOpts":null,"GwPriority":0,"NetworkID":"","EndpointID":"","Gateway":"","IPAddress":"","IPPrefixLen":0,"IPv6Gateway":"","GlobalIPv6Address":"","GlobalIPv6PrefixLen":0,"DNSNames":null}}}}`

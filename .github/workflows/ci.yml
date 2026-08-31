@@ -29,6 +29,18 @@ jobs:
       - name: Syntax-check shell sources
         run: bash -n install.sh bw-common.sh claude-bw.sh opencode-bw.sh pi-bw.sh hooks/bw-deny-files.sh test/install_hooks_test.sh test/integration_test.sh
 
+      # gofmt is the first thing a reader of a public Go repo runs, and two
+      # files on this branch were unformatted. Cheap to check, so check it.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt -l reported unformatted files:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
+
       - name: Go tests
         run: go test ./...
 
