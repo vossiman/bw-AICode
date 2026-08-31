@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -474,30 +475,49 @@ func (v *Validator) validateNetworkCreate(r *http.Request) Decision {
 	return allow("network create allowed")
 }
 
-// globalReadPaths are read endpoints that expose no per-container data and
-// are safe to allow wholesale. Anything not listed is denied by default.
+// globalReadPaths are read endpoints that carry no per-container payload and
+// are allowed wholesale. Anything not listed is denied by default.
 //
-// Entries mapped to false are documentation: they are endpoints considered
-// and deliberately NOT allowed (a false value reads the same as absent).
+// They are not free: each one discloses host-wide *names* — of containers,
+// images and networks belonging to other projects. That residual is accepted
+// because the CLI cannot work without them, and closing it needs
+// ownership-filtered response bodies rather than a route decision.
 var globalReadPaths = map[string]bool{
 	"/_ping":   true,
 	"/version": true,
 	"/info":    true,
-	// /events streams host-wide container lifecycle, so it does disclose
-	// other projects' container names. It is kept allowed because
-	// /containers/json, directly above, already discloses the same
-	// host-wide inventory in snapshot form, and compose/CLI attach flows
-	// depend on the stream. Narrowing the two together needs response-body
-	// filtering (a separate change); until then this is one recorded
-	// residual, not two, and it is not widened here.
+	// /events discloses STRICTLY MORE than /containers/json, not the same:
+	// it is a continuous stream, so on top of the same host-wide inventory
+	// it leaks event timing and the action detail, including
+	// "exec_create: <cmd>" — that is other projects' exec command lines and
+	// whatever was passed as arguments. It is kept anyway, deliberately,
+	// because compose's attach path depends on it and the only real fix is
+	// filtering the stream by ownership. Accepted, not equivalent.
 	"/events":          true,
 	"/containers/json": true,
 	"/images/json":     true,
 	"/networks":        true,
-	"/volumes":         true,
-	"/build/cache":     true,
 	"/system/df":       true,
-	"/distribution":    false,
+	// Deliberately NOT here:
+	//
+	//   /volumes — the volume LIST. A volume name is directly actionable:
+	//     validateContainerCreate treats any Binds entry without a slash as
+	//     a Docker-managed named volume and does not validate it
+	//     (BWAICODE-4), so enumerate-then-bind reads another project's data.
+	//     Compose does not need the list: it resolves named volumes with
+	//     inspect-by-name (allowed below) and falls back to create. The
+	//     costs are `docker volume ls` and the discovery step of
+	//     `compose down -v`, whose actual removal is a DELETE that the write
+	//     model already denies. Restore by re-adding this one entry if a
+	//     real workflow turns out to need it.
+	//
+	//   /build/cache — not a Docker route at all (the builder endpoint is
+	//     POST /build/prune), so listing it allowed nothing and only
+	//     suggested it did.
+	//
+	//   /distribution/{name}/json — a per-image registry probe. It is a
+	//     path with a parameter, so no exact entry here could ever match it
+	//     anyway; it stays unmodelled and therefore denied.
 }
 
 // validateRead decides GET/HEAD requests. Global list endpoints are allowed;
@@ -514,11 +534,20 @@ func (v *Validator) validateRead(r *http.Request) Decision {
 		return deny(fmt.Sprintf("percent-encoded read path is not allowed: %s %s", r.Method, r.URL.RawPath))
 	}
 
-	// Match on the version-stripped path. Go's net/http does not clean
-	// URL.Path for a plain http.Handler (only ServeMux redirects), so
-	// traversal like /containers/../containers/x/archive arrives verbatim —
-	// and because every pattern below is anchored at both ends with [^/]+
-	// for the ID, such a path matches nothing and falls through to deny.
+	// Go's net/http does not clean URL.Path for a plain http.Handler (only
+	// ServeMux cleans, by redirecting), so traversal arrives verbatim. Most
+	// patterns below take [^/]+ for the ID and so cannot be traversed, but
+	// ReImageInspect has to take (.+) to accept registry/repository names
+	// with slashes ("ghcr.io/org/img"), and .+ crosses path separators:
+	// GET /images/../containers/{foreign}/json matched it and was allowed.
+	// Rather than break real image names, require the path to be already
+	// clean. Any "..", any "." segment and any doubled or trailing slash is
+	// refused here, before routing.
+	if cleaned := pathpkg.Clean(r.URL.Path); cleaned != r.URL.Path {
+		return deny(fmt.Sprintf("read path is not canonical: %s %s", r.Method, r.URL.Path))
+	}
+
+	// Match on the version-stripped path.
 	path := stripVersion(r.URL.Path)
 
 	// After stripping exactly one well-formed prefix, nothing version-shaped

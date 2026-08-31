@@ -60,9 +60,14 @@ func TestReadsAreModelledNotBlanketAllowed(t *testing.T) {
 	tracker.Add("mine123")
 	v := NewValidator(cfg, tracker)
 
+	// NOTE: the task brief also listed "/volumes" here. The volume LIST is
+	// deliberately not global — a volume name is directly actionable through
+	// the unvalidated named-volume bind (BWAICODE-4), so enumeration is the
+	// first half of a cross-project data read. Inspect-by-name, which is what
+	// compose actually uses, stays allowed and is asserted below.
 	allowedGlobals := []string{
 		"/_ping", "/version", "/info",
-		"/containers/json", "/images/json", "/networks", "/volumes",
+		"/containers/json", "/images/json", "/networks",
 		"/v1.45/containers/json", "/v1.45/version",
 	}
 	for _, u := range allowedGlobals {
@@ -138,6 +143,60 @@ func TestReadsAreModelledNotBlanketAllowed(t *testing.T) {
 			t.Error("an unmodelled read endpoint must be denied by default")
 		}
 	})
+
+	t.Run("volume list is denied, volume inspect is allowed", func(t *testing.T) {
+		if d := v.Validate(makeRequest("GET", "/v1.45/volumes", "")); d.Allow {
+			t.Error("volume enumeration must be denied: a volume name is directly bindable (BWAICODE-4)")
+		}
+		if d := v.Validate(makeRequest("GET", "/v1.45/volumes/myproj_data", "")); !d.Allow {
+			t.Errorf("volume inspect-by-name should be allowed, got deny: %s", d.Reason)
+		}
+	})
+}
+
+// ReImageInspect must take (.+) to accept registry/repository image names,
+// and .+ crosses "/". Without a canonical-path requirement these reach
+// container inspect through the image route. Probed and confirmed allowed
+// before the fix.
+func TestReadTraversalViaImageInspect(t *testing.T) {
+	cfg := &config.Config{
+		ProjectDir:      "/project",
+		AllowedImages:   []string{"postgres:16"},
+		VolumeMountRoot: "/project",
+	}
+	tracker := ownership.New()
+	tracker.Add("mine123")
+	v := NewValidator(cfg, tracker)
+
+	for _, u := range []string{
+		"/images/../containers/someoneelse/json",
+		"/images/x/../../containers/someoneelse/json",
+		"/v1.45/images/../containers/someoneelse/json",
+		// The same trick aimed at the endpoint that actually leaks bytes.
+		"/images/../containers/someoneelse/archive",
+		"/v1.45/images/a/b/../../../containers/someoneelse/export",
+	} {
+		t.Run("GET "+u, func(t *testing.T) {
+			if d := v.Validate(makeRequest("GET", u, "")); d.Allow {
+				t.Errorf("traversal through the image route must be denied, got allow: %s", d.Reason)
+			}
+		})
+	}
+
+	// Real registry/repository names must still inspect fine: the fix is a
+	// canonical-path requirement, not a tighter regex.
+	for _, u := range []string{
+		"/images/postgres/json",
+		"/images/library/postgres/json",
+		"/v1.45/images/ghcr.io/org/team/img/json",
+		"/v1.45/images/ghcr.io/org/img/history",
+	} {
+		t.Run("GET "+u+" allowed", func(t *testing.T) {
+			if d := v.Validate(makeRequest("GET", u, "")); !d.Allow {
+				t.Errorf("GET %s should be allowed, got deny: %s", u, d.Reason)
+			}
+		})
+	}
 }
 
 // The deny-by-default boundary of the read model: anything that is not an
@@ -180,6 +239,13 @@ func TestReadModelBoundary(t *testing.T) {
 		"/plugins",
 		"/images/search",
 		"/containers/mine123/attach/ws",
+		// Volume enumeration (see BWAICODE-4), and two entries that used to
+		// sit in globalReadPaths without being real routes.
+		"/volumes",
+		"/v1.45/volumes",
+		"/build/cache",
+		"/distribution",
+		"/distribution/postgres/json",
 	}
 	for _, u := range denied {
 		t.Run("GET "+u, func(t *testing.T) {
