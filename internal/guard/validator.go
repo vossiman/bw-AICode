@@ -212,11 +212,32 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 
 	// Check HostConfig.Mounts (the real Docker Engine API field; the engine
 	// ignores a top-level Mounts key entirely, so that field is not checked).
+	//
+	// Default-deny on mount Type: only "bind" (validated identically to
+	// Binds, resolving a relative Source against ProjectDir first) and
+	// "tmpfs" (no host source, harmless) are permitted. Everything else is
+	// denied outright — most importantly "volume", which can mount host root
+	// via an inline local-driver bind (VolumeOptions.DriverConfig with
+	// options like {"type":"none","device":"/","o":"bind"}) without ever
+	// setting Source or Type=="bind". Also denied: "npipe", "cluster", an
+	// empty Type, an unrecognised Type, and any case variant. Enumerating
+	// dangerous shapes lost twice already (Binds, then top-level Mounts);
+	// this makes an unknown future mount type fail closed instead of
+	// silently passing.
 	for _, mount := range req.HostConfig.Mounts {
-		if mount.Type == "bind" {
-			if !v.config.IsVolumePathAllowed(mount.Source) {
-				return deny(fmt.Sprintf("volume mount path %q is not allowed", mount.Source))
+		switch mount.Type {
+		case "bind":
+			hostPath := mount.Source
+			if !filepath.IsAbs(hostPath) {
+				hostPath = filepath.Join(v.config.ProjectDir, hostPath)
 			}
+			if !v.config.IsVolumePathAllowed(hostPath) {
+				return deny(fmt.Sprintf("volume mount path %q is not allowed", hostPath))
+			}
+		case "tmpfs":
+			// No host source; nothing to check.
+		default:
+			return deny(fmt.Sprintf("mount type %q is not allowed", mount.Type))
 		}
 	}
 
@@ -243,8 +264,12 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 		return deny("host user namespace is not allowed")
 	}
 
-	// Check IpcMode
-	if req.HostConfig.IpcMode == "host" {
+	// Check IpcMode. "host" joins the host IPC namespace directly; a
+	// "container:<id>" value joins another container's IPC namespace (and
+	// hence its shared memory) — including, plausibly, the one container the
+	// guard permits to be privileged. UTSMode, CgroupnsMode and UsernsMode
+	// have no "container:" form in the engine, so those are left as-is.
+	if req.HostConfig.IpcMode == "host" || strings.HasPrefix(req.HostConfig.IpcMode, "container:") {
 		return deny("host IPC mode is not allowed")
 	}
 

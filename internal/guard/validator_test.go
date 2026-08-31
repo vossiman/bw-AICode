@@ -216,10 +216,12 @@ func TestValidateContainerCreate(t *testing.T) {
 			allow:  false,
 			reason: "device",
 		},
-		// Mounts array (newer Docker API)
+		// Mounts array (newer Docker API). Docker only reads mounts from
+		// HostConfig.Mounts, so both cases below post there; a top-level
+		// Mounts key is a no-op and must never be what makes a test pass.
 		{
 			name:  "mount under project dir",
-			body:  `{"Image": "postgres:16", "Mounts": [{"Type": "bind", "Source": "/project/data", "Target": "/data"}]}`,
+			body:  `{"Image": "postgres:16", "HostConfig": {"Mounts": [{"Type": "bind", "Source": "/project/data", "Target": "/data"}]}}`,
 			allow: true,
 		},
 		{
@@ -227,6 +229,20 @@ func TestValidateContainerCreate(t *testing.T) {
 			body:   `{"Image": "postgres:16", "HostConfig": {"Mounts": [{"Type": "bind", "Source": "/etc/secrets", "Target": "/secrets"}]}}`,
 			allow:  false,
 			reason: "volume",
+		},
+		// Round-2 fix: mount Type is now default-deny. "volume" (including an
+		// inline local-driver bind of host root via VolumeOptions.DriverConfig)
+		// must be denied outright, without needing to parse VolumeOptions at all.
+		{
+			name:   "mount type volume with inline local-driver host bind is denied",
+			body:   `{"Image": "postgres:16", "HostConfig": {"Mounts": [{"Type": "volume", "Target": "/host", "VolumeOptions": {"DriverConfig": {"Name": "local", "Options": {"type": "none", "device": "/", "o": "bind"}}}}]}}`,
+			allow:  false,
+			reason: "mount type",
+		},
+		{
+			name:  "mount type tmpfs is allowed",
+			body:  `{"Image": "postgres:16", "HostConfig": {"Mounts": [{"Type": "tmpfs", "Target": "/tmp/scratch"}]}}`,
+			allow: true,
 		},
 		// Privileged false should be fine
 		{
@@ -552,6 +568,19 @@ func TestValidateContainerCreateInfraDigestOnly(t *testing.T) {
 		}
 	})
 
+	// Round-2 fix: mount Type was checked only for "bind"; "volume" with an
+	// inline local-driver bind mounts the host without ever setting Source
+	// or Type=="bind" (Docker builds the volume from VolumeOptions.DriverConfig).
+	// This is the exact PoC from review: /:/host via a "local" driver bind
+	// option, on the digest-matched infra image.
+	t.Run("real infra digest may NOT mount the host via an inline volume-driver bind", func(t *testing.T) {
+		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"Mounts": [{"Type": "volume", "Target": "/host", "VolumeOptions": {"DriverConfig": {"Name": "local", "Options": {"type": "none", "device": "/", "o": "bind"}}}}]}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: an inline local-driver volume bind of / must be denied even for a digest-matched infra image")
+		}
+	})
+
 	t.Run("real infra digest may NOT add capabilities", func(t *testing.T) {
 		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"CapAdd": ["SYS_ADMIN"]}}`
 		r := makeRequest("POST", "/v1.45/containers/create", body)
@@ -576,6 +605,17 @@ func TestValidateContainerCreateInfraDigestOnly(t *testing.T) {
 		r := makeRequest("POST", "/v1.45/containers/create", body)
 		if d := v.Validate(r); d.Allow {
 			t.Error("CAF-001: container:<id> pid namespace must be denied, not just literal host")
+		}
+	})
+
+	// Round-2 fix: IpcMode also accepts "container:<id>", joining another
+	// container's IPC namespace (and its shared memory) — including,
+	// plausibly, the one container the guard permits to be privileged.
+	t.Run("real infra digest may NOT join another container's IPC namespace", func(t *testing.T) {
+		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"IpcMode": "container:some-other-id"}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: container:<id> IPC namespace must be denied, not just literal host")
 		}
 	})
 
