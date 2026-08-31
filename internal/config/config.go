@@ -25,6 +25,14 @@ var knownSocketPaths = map[string]bool{
 	"/run/podman.sock":      true,
 }
 
+// socketParentDirs are directories whose contents are the sockets above:
+// mounting the directory itself exposes the socket inside it just as
+// surely as mounting the socket path directly.
+var socketParentDirs = map[string]bool{
+	"/var/run": true,
+	"/run":     true,
+}
+
 type Config struct {
 	ProjectDir         string   `json:"project_dir"`
 	ComposeProject     string   `json:"compose_project"`
@@ -126,9 +134,17 @@ func (c *Config) IsNetworkAllowed(name string) bool {
 	return false
 }
 
-// isSocketPath returns true if the path refers to a known Docker/Podman socket.
+// isSocketPath returns true if the path refers to a known Docker/Podman
+// socket, a directory that would expose one if mounted, or the rootless
+// runtime directory a per-user daemon socket lives under.
 func isSocketPath(cleanPath string) bool {
 	if knownSocketPaths[cleanPath] {
+		return true
+	}
+	if socketParentDirs[cleanPath] {
+		return true
+	}
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" && cleanPath == filepath.Clean(xdg) {
 		return true
 	}
 	return socketBasenames[filepath.Base(cleanPath)]
@@ -154,17 +170,19 @@ func (c *Config) IsVolumePathAllowed(hostPath string) bool {
 		}
 	}
 
-	// Check explicitly allowed volume paths first (these override socket checks).
-	// Compare against both clean and resolved paths to handle symlinks like /var/run -> /run.
+	// Socket paths are denied unconditionally. This check deliberately runs
+	// BEFORE AllowedVolumePaths: an explicit entry used to override it, which
+	// turned any path reaching the allowlist into a socket mount (CAF-001).
+	if isSocketPath(cleanPath) || isSocketPath(resolved) {
+		return false
+	}
+
+	// Check explicitly allowed volume paths. Compare against both clean and
+	// resolved paths to handle symlinks like /var/run -> /run.
 	for _, allowed := range c.AllowedVolumePaths {
 		if cleanPath == allowed || resolved == allowed {
 			return true
 		}
-	}
-
-	// Block known socket paths (only if not explicitly allowed above)
-	if isSocketPath(cleanPath) || isSocketPath(resolved) {
-		return false
 	}
 
 	if c.VolumeMountRoot == "" {
