@@ -224,7 +224,7 @@ func TestValidateContainerCreate(t *testing.T) {
 		},
 		{
 			name:   "mount outside project dir",
-			body:   `{"Image": "postgres:16", "Mounts": [{"Type": "bind", "Source": "/etc/secrets", "Target": "/secrets"}]}`,
+			body:   `{"Image": "postgres:16", "HostConfig": {"Mounts": [{"Type": "bind", "Source": "/etc/secrets", "Target": "/secrets"}]}}`,
 			allow:  false,
 			reason: "volume",
 		},
@@ -540,6 +540,18 @@ func TestValidateContainerCreateInfraDigestOnly(t *testing.T) {
 		}
 	})
 
+	// Round-1 fix: HostConfig.Mounts (the field the real Docker Engine API
+	// reads) was not checked at all — only a top-level Mounts key, which
+	// Docker ignores. A digest-matched infra image could bind-mount host
+	// root via HostConfig.Mounts and sail through every check.
+	t.Run("real infra digest may NOT mount the host via HostConfig.Mounts", func(t *testing.T) {
+		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"Mounts": [{"Type": "bind", "Source": "/", "Target": "/host"}]}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: HostConfig.Mounts bind of / must be denied even for a digest-matched infra image")
+		}
+	})
+
 	t.Run("real infra digest may NOT add capabilities", func(t *testing.T) {
 		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"CapAdd": ["SYS_ADMIN"]}}`
 		r := makeRequest("POST", "/v1.45/containers/create", body)
@@ -553,6 +565,25 @@ func TestValidateContainerCreateInfraDigestOnly(t *testing.T) {
 		r := makeRequest("POST", "/v1.45/containers/create", body)
 		if d := v.Validate(r); d.Allow {
 			t.Error("infra trust must not permit host pid namespace")
+		}
+	})
+
+	// Round-1 fix: only the literal "host" value was checked; "container:<id>"
+	// joins another container's namespace, a plausible pivot into the
+	// genuinely-privileged buildkit container's namespace.
+	t.Run("real infra digest may NOT join another container's pid namespace", func(t *testing.T) {
+		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"PidMode": "container:some-other-id"}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: container:<id> pid namespace must be denied, not just literal host")
+		}
+	})
+
+	t.Run("real infra digest may NOT join another container's network namespace", func(t *testing.T) {
+		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"NetworkMode": "container:some-other-id"}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: container:<id> network namespace must be denied, not just literal host")
 		}
 	})
 

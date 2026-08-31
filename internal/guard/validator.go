@@ -41,28 +41,36 @@ type deviceMapping struct {
 	CgroupPermissions string `json:"CgroupPermissions"`
 }
 
+// mountEntry mirrors one entry of Docker's HostConfig.Mounts.
+type mountEntry struct {
+	Type   string `json:"Type"`
+	Source string `json:"Source"`
+	Target string `json:"Target"`
+}
+
 // containerCreateRequest is the subset of fields we inspect from container create.
 type containerCreateRequest struct {
 	Image      string `json:"Image"`
 	HostConfig struct {
-		Binds         []string        `json:"Binds"`
-		Privileged    bool            `json:"Privileged"`
-		PidMode       string          `json:"PidMode"`
-		NetworkMode   string          `json:"NetworkMode"`
-		UsernsMode    string          `json:"UsernsMode"`
-		IpcMode       string          `json:"IpcMode"`
-		CgroupnsMode  string          `json:"CgroupnsMode"`
-		UTSMode       string          `json:"UTSMode"`
-		CapAdd        []string        `json:"CapAdd"`
-		Devices       []deviceMapping `json:"Devices"`
-		VolumesFrom   []string        `json:"VolumesFrom"`
-		SecurityOpt   []string        `json:"SecurityOpt"`
+		Binds        []string        `json:"Binds"`
+		Mounts       []mountEntry    `json:"Mounts"`
+		Privileged   bool            `json:"Privileged"`
+		PidMode      string          `json:"PidMode"`
+		NetworkMode  string          `json:"NetworkMode"`
+		UsernsMode   string          `json:"UsernsMode"`
+		IpcMode      string          `json:"IpcMode"`
+		CgroupnsMode string          `json:"CgroupnsMode"`
+		UTSMode      string          `json:"UTSMode"`
+		CapAdd       []string        `json:"CapAdd"`
+		Devices      []deviceMapping `json:"Devices"`
+		VolumesFrom  []string        `json:"VolumesFrom"`
+		SecurityOpt  []string        `json:"SecurityOpt"`
 	} `json:"HostConfig"`
-	Mounts []struct {
-		Type   string `json:"Type"`
-		Source string `json:"Source"`
-		Target string `json:"Target"`
-	} `json:"Mounts"`
+	// Mounts at the top level is not a real Docker Engine API field (the
+	// engine only reads HostConfig.Mounts), but is kept here, harmlessly, in
+	// case any caller-side tooling sends it; only HostConfig.Mounts is
+	// actually validated below.
+	Mounts []mountEntry `json:"Mounts"`
 }
 
 // execCreateRequest is the subset of fields we inspect from exec create.
@@ -202,8 +210,9 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 		}
 	}
 
-	// Check Mounts array (newer Docker API)
-	for _, mount := range req.Mounts {
+	// Check HostConfig.Mounts (the real Docker Engine API field; the engine
+	// ignores a top-level Mounts key entirely, so that field is not checked).
+	for _, mount := range req.HostConfig.Mounts {
 		if mount.Type == "bind" {
 			if !v.config.IsVolumePathAllowed(mount.Source) {
 				return deny(fmt.Sprintf("volume mount path %q is not allowed", mount.Source))
@@ -216,13 +225,16 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 		return deny("privileged containers are not allowed")
 	}
 
-	// Check PidMode
-	if req.HostConfig.PidMode == "host" {
+	// Check PidMode. "host" joins the host pid namespace directly; a
+	// "container:<id>" value joins another container's namespace, which is
+	// just as dangerous if that container happens to be privileged (e.g. the
+	// digest-matched buildkit infra container).
+	if req.HostConfig.PidMode == "host" || strings.HasPrefix(req.HostConfig.PidMode, "container:") {
 		return deny("host pid namespace is not allowed")
 	}
 
-	// Check NetworkMode
-	if req.HostConfig.NetworkMode == "host" {
+	// Check NetworkMode (same host / container: reasoning as PidMode above).
+	if req.HostConfig.NetworkMode == "host" || strings.HasPrefix(req.HostConfig.NetworkMode, "container:") {
 		return deny("host network mode is not allowed")
 	}
 
@@ -403,7 +415,8 @@ func (v *Validator) validateImageCreate(r *http.Request) Decision {
 		return deny("image pull requires fromImage parameter")
 	}
 
-	if !v.config.IsImageAllowed(fromImage) && !v.config.IsInfraImage(fromImage) {
+	infraImage := !v.config.IsReadOnly() && v.config.IsInfraImage(fromImage)
+	if !v.config.IsImageAllowed(fromImage) && !infraImage {
 		return deny(fmt.Sprintf("image %q is not in the allowlist", fromImage))
 	}
 
