@@ -196,16 +196,12 @@ derive_docker_allowlist() {
         [[ -n "$net" ]] && networks+=("$net")
       done <<< "$compose_networks" || true
 
-      # Extract bind mount sources outside project dir (e.g. /var/run/docker.sock)
-      local compose_binds
-      compose_binds="$(echo "$resolved" | jq -r '
-        [.services // {} | to_entries[] | .value.volumes // [] | .[] |
-         select(type == "object" and .type == "bind") | .source] | unique[]
-      ' 2>/dev/null)"
-      while IFS= read -r bp; do
-        [[ -n "$bp" ]] || continue
-        case "$bp" in "$STARTDIR"|"$STARTDIR"/*) ;; *) extra_volume_paths+=("$bp") ;; esac
-      done <<< "$compose_binds" || true
+      # Bind mount sources are deliberately NOT harvested from the compose
+      # file. The project is untrusted input, so letting it nominate entries
+      # in allowed_volume_paths meant a repository could request "/" or a
+      # Docker socket and have the guard honour it (CAF-001). Operators who
+      # genuinely need an out-of-project mount set BW_EXTRA_VOLUME_PATHS
+      # host-side; see docs/docker-security.md.
     else
       echo "Warning: docker compose config failed for $compose_file; allowlist may be incomplete" >&2
       compose_project="$(basename "$STARTDIR")"
@@ -291,6 +287,15 @@ derive_docker_allowlist() {
 
   # Check global Claude desktop config
   _extract_mcp_docker_images "$HOME/.config/Claude/claude_desktop_config.json"
+
+  # --- Source 3: operator-supplied extra volume paths (host-side only) ---
+  # Colon-separated, set in the user's own shell, never read from the project.
+  if [[ -n "${BW_EXTRA_VOLUME_PATHS:-}" ]]; then
+    local IFS=:
+    for bp in $BW_EXTRA_VOLUME_PATHS; do
+      [[ -n "$bp" ]] && extra_volume_paths+=("$bp")
+    done
+  fi
 
   # --- Deduplicate ---
   local unique_images=() unique_networks=()

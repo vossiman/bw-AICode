@@ -141,6 +141,56 @@ fi
 rm -rf "$SYMLINK_TEST_HOME"
 
 # ============================================================
+# Test 0b: compose bind paths must NOT reach the guard config
+# ============================================================
+echo ""
+echo "--- compose bind harvesting (CAF-001) ---"
+
+BIND_TEST_HOME="$(mktemp -d /tmp/bw-bind-test-XXXXXX)"
+mkdir -p "$BIND_TEST_HOME/project"
+cat > "$BIND_TEST_HOME/project/docker-compose.yml" <<'YAML'
+services:
+  app:
+    image: postgres:16
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /:/host
+YAML
+
+(
+  set +e
+  cd "$BIND_TEST_HOME/project" || exit 1
+  # shellcheck disable=SC1090
+  source "$PROJECT_DIR/bw-common.sh"
+  derive_docker_allowlist 2>/dev/null
+
+  if [[ -z "${BW_DOCKER_GUARD_CONFIG:-}" || ! -f "$BW_DOCKER_GUARD_CONFIG" ]]; then
+    echo "SKIP no config generated (docker compose unavailable)"
+    exit 2
+  fi
+
+  paths="$(jq -r '.allowed_volume_paths[]?' "$BW_DOCKER_GUARD_CONFIG")"
+  if grep -q 'docker\.sock' <<< "$paths"; then
+    echo "FAIL docker.sock reached allowed_volume_paths"
+    exit 1
+  fi
+  if grep -qx '/' <<< "$paths"; then
+    echo "FAIL / reached allowed_volume_paths"
+    exit 1
+  fi
+  echo "OK compose binds did not reach the allowlist"
+  exit 0
+)
+bind_test_rc=$?
+case $bind_test_rc in
+  0) ok "compose binds excluded from allowed_volume_paths" ;;
+  2) skip "compose bind harvesting" "docker compose unavailable" ;;
+  *) fail "compose bind harvesting" "project-controlled bind path reached the guard config" ;;
+esac
+
+rm -rf "$BIND_TEST_HOME"
+
+# ============================================================
 # bw-docker-guard integration tests
 # ============================================================
 echo ""
