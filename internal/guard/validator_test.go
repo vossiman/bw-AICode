@@ -471,54 +471,96 @@ func TestValidateImagePull(t *testing.T) {
 		}
 	})
 
-	// Docker infrastructure image (moby/buildkit) should be allowed in guarded mode
-	t.Run("buildkit infra image pull allowed", func(t *testing.T) {
-		r := makeRequest("POST", "/v1.45/images/create?fromImage=docker.io/moby/buildkit", "")
-		d := v.Validate(r)
+	// Docker infrastructure image (moby/buildkit) is matched by content
+	// digest, never by name (CAF-001). Pulling by name alone must NOT be
+	// treated as infra unless it is also on the plain image allowlist.
+	t.Run("buildkit digest-pinned image pull allowed", func(t *testing.T) {
+		vDigest, _ := newTestValidator()
+		digest := "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+		vDigest.config.InfraImageDigests = []string{digest}
+		r := makeRequest("POST", "/v1.45/images/create?fromImage=moby/buildkit@"+digest, "")
+		d := vDigest.Validate(r)
 		if !d.Allow {
-			t.Errorf("moby/buildkit pull should be allowed as docker infra image, got deny: %s", d.Reason)
+			t.Errorf("digest-pinned moby/buildkit pull should be allowed as docker infra image, got deny: %s", d.Reason)
 		}
 	})
 
-	t.Run("buildkit infra image pull with tag allowed", func(t *testing.T) {
+	t.Run("buildkit name-only pull without digest denied", func(t *testing.T) {
 		r := makeRequest("POST", "/v1.45/images/create?fromImage=docker.io/moby/buildkit:buildx-stable-1", "")
 		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("moby/buildkit:buildx-stable-1 pull should be allowed, got deny: %s", d.Reason)
+		if d.Allow {
+			t.Error("CAF-001: an infra image pull without the pinned digest must be denied")
 		}
 	})
 }
 
-func TestValidateContainerCreateBuildkitInfra(t *testing.T) {
-	v, _ := newTestValidator()
+// Was TestValidateContainerCreateBuildkitInfra, which asserted that a
+// privileged moby/buildkit create must be ALLOWED on the strength of its
+// name alone. That is CAF-001 step 2. Inverted here.
+func TestValidateContainerCreateInfraDigestOnly(t *testing.T) {
+	digest := "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	cfg := &config.Config{
+		ProjectDir:        "/project",
+		AllowedImages:     []string{"postgres:16"},
+		AllowedNetworks:   []string{"mynet"},
+		VolumeMountRoot:   "/project",
+		InfraImageDigests: []string{digest},
+	}
+	v := NewValidator(cfg, ownership.New())
 
-	// Buildkit container creation should be allowed in guarded mode
-	t.Run("buildkit container create allowed", func(t *testing.T) {
-		body := `{"Image": "docker.io/moby/buildkit:buildx-stable-1", "HostConfig": {}}`
+	t.Run("self-minted infra NAME is denied", func(t *testing.T) {
+		body := `{"Image": "docker.io/moby/buildkit:pwn", "HostConfig": {}}`
 		r := makeRequest("POST", "/v1.45/containers/create", body)
-		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("moby/buildkit container create should be allowed, got deny: %s", d.Reason)
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: an image named moby/buildkit without the pinned digest must be denied")
 		}
 	})
 
-	// Buildkit runs privileged — should be allowed as infra image
-	t.Run("buildkit privileged container allowed", func(t *testing.T) {
-		body := `{"Image": "docker.io/moby/buildkit:buildx-stable-1", "HostConfig": {"Privileged": true}}`
+	t.Run("self-minted infra name with privileged is denied", func(t *testing.T) {
+		body := `{"Image": "moby/buildkit:pwn", "HostConfig": {"Privileged": true}}`
 		r := makeRequest("POST", "/v1.45/containers/create", body)
-		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("privileged moby/buildkit should be allowed as docker infra, got deny: %s", d.Reason)
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001: the escape chain's step 2 must be denied")
 		}
 	})
 
-	// Non-infra images should still be denied privileged
-	t.Run("non-infra privileged container denied", func(t *testing.T) {
+	t.Run("real infra digest may be privileged", func(t *testing.T) {
+		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"Privileged": true}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		if d := v.Validate(r); !d.Allow {
+			t.Errorf("digest-pinned buildkit needs privileged, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("real infra digest may NOT mount the host", func(t *testing.T) {
+		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"Binds": ["/:/host"]}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		if d := v.Validate(r); d.Allow {
+			t.Error("infra trust must relax Privileged only, never bind mounts")
+		}
+	})
+
+	t.Run("real infra digest may NOT add capabilities", func(t *testing.T) {
+		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"CapAdd": ["SYS_ADMIN"]}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		if d := v.Validate(r); d.Allow {
+			t.Error("infra trust must not permit CapAdd")
+		}
+	})
+
+	t.Run("real infra digest may NOT use host pid namespace", func(t *testing.T) {
+		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"PidMode": "host"}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
+		if d := v.Validate(r); d.Allow {
+			t.Error("infra trust must not permit host pid namespace")
+		}
+	})
+
+	t.Run("non-infra privileged container still denied", func(t *testing.T) {
 		body := `{"Image": "postgres:16", "HostConfig": {"Privileged": true}}`
 		r := makeRequest("POST", "/v1.45/containers/create", body)
-		d := v.Validate(r)
-		if d.Allow {
-			t.Errorf("privileged non-infra container should be denied")
+		if d := v.Validate(r); d.Allow {
+			t.Error("privileged non-infra container should be denied")
 		}
 	})
 }

@@ -176,17 +176,12 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 		return deny(fmt.Sprintf("failed to parse request body: %v", err))
 	}
 
-	// Check image allowlist
-	infraImage := !v.config.IsReadOnly() && isDockerInfraImage(req.Image)
+	// Infra images are matched by content digest (see config.IsInfraImage).
+	// Infra trust relaxes exactly one field, Privileged, because buildkit
+	// genuinely requires it. Every other HostConfig check below still runs.
+	infraImage := !v.config.IsReadOnly() && v.config.IsInfraImage(req.Image)
 	if !v.config.IsImageAllowed(req.Image) && !infraImage {
 		return deny(fmt.Sprintf("image %q is not in the allowlist", req.Image))
-	}
-
-	// Docker infrastructure images (e.g. moby/buildkit) are trusted internal
-	// machinery — skip remaining security checks (privileged, volumes, etc.)
-	// since they are not user-specified containers.
-	if infraImage {
-		return allow("docker infrastructure container allowed")
 	}
 
 	// Check bind mounts (HostConfig.Binds)
@@ -217,7 +212,7 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	}
 
 	// Check privileged mode
-	if req.HostConfig.Privileged {
+	if req.HostConfig.Privileged && !infraImage {
 		return deny("privileged containers are not allowed")
 	}
 
@@ -375,30 +370,12 @@ func (v *Validator) validateImageLoad(r *http.Request) Decision {
 	return allow("image load allowed")
 }
 
-// dockerInfraImages are images that Docker pulls internally for infrastructure
-// (e.g. buildkit for docker buildx). These are not user-specified and should be
-// allowed when builds are permitted (i.e. guarded mode, not read-only).
-var dockerInfraImages = []string{
-	"moby/buildkit",
-}
-
 // dockerInfraContainerPrefixes are name prefixes for persistent Docker
 // infrastructure containers (e.g. buildx_buildkit_*). These containers are
 // created once and reused across sessions, so the ownership tracker won't
 // know about them.
 var dockerInfraContainerPrefixes = []string{
 	"buildx_buildkit_",
-}
-
-// isDockerInfraImage checks if the image is a Docker infrastructure image.
-func isDockerInfraImage(image string) bool {
-	norm := config.NormalizeImageName(image)
-	for _, infra := range dockerInfraImages {
-		if norm == infra {
-			return true
-		}
-	}
-	return false
 }
 
 // isDockerInfraContainer checks if the container name matches a known Docker
@@ -418,10 +395,8 @@ func (v *Validator) validateImageCreate(r *http.Request) Decision {
 		return deny("image pull requires fromImage parameter")
 	}
 
-	if !v.config.IsImageAllowed(fromImage) {
-		if v.config.IsReadOnly() || !isDockerInfraImage(fromImage) {
-			return deny(fmt.Sprintf("image %q is not in the allowlist", fromImage))
-		}
+	if !v.config.IsImageAllowed(fromImage) && !v.config.IsInfraImage(fromImage) {
+		return deny(fmt.Sprintf("image %q is not in the allowlist", fromImage))
 	}
 
 	return allow("image pull allowed")
