@@ -1,6 +1,7 @@
 package ownership
 
 import (
+	"strings"
 	"sync"
 	"testing"
 )
@@ -29,11 +30,31 @@ func TestTrackerRemove(t *testing.T) {
 
 func TestTrackerPrefixMatch(t *testing.T) {
 	tr := New()
-	tr.Add("abc123def456full7890abcdef")
+	// A genuine Docker full ID: 64 lowercase hex characters. Short-ID
+	// prefix matching only targets entries shaped like this (see
+	// isFullContainerID / fix round 2, MINOR).
+	fullID := "abc123def456" + strings.Repeat("0", 52)
+	tr.Add(fullID)
 
 	// Docker API sometimes uses short IDs (first 12 chars)
 	if !tr.IsOwned("abc123def456") {
 		t.Error("expected short ID to match full ID prefix")
+	}
+}
+
+// Fix round 2, MINOR: a short hex query must not prefix-match an entry that
+// merely LOOKS hex but isn't a genuine 64-char full ID. Without the
+// isFullContainerID gate, a crafted 12+ character hex NAME (a legal Docker
+// name) seeded or tracked at a length shorter than 64 could be used as a
+// prefix-match target it was never meant to be.
+func TestShortIDDoesNotMatchNonFullLengthHexEntry(t *testing.T) {
+	tr := New()
+	// 20 hex characters: passes isShortContainerID's shape check, but is not
+	// a 64-character full ID.
+	tr.Add("deadbeefcafe12345678")
+
+	if tr.IsOwned("deadbeefcafe") {
+		t.Error("a short hex query must not match a non-full-length hex-looking entry by prefix")
 	}
 }
 

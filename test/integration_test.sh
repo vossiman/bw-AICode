@@ -188,6 +188,94 @@ case $bind_test_rc in
   *) fail "compose bind harvesting" "project-controlled bind path reached the guard config" ;;
 esac
 
+# ============================================================
+# Test 0c: preowned_containers must carry FULL (64-char) container IDs
+# (CAF-001 fix round 2, I3): a hand-built test fixture can't catch a
+# truncation bug in how derive_docker_allowlist actually produces its
+# output, so this exercises the real function end to end against a real
+# Docker daemon, using a throwaway image tagged "moby/buildkit" and a
+# container created from it.
+# ============================================================
+echo ""
+echo "--- preowned_containers ID shape (CAF-001 I3) ---"
+
+SHAPE_TEST_HOME="$(mktemp -d /tmp/bw-shape-test-XXXXXX)"
+mkdir -p "$SHAPE_TEST_HOME/project"
+
+(
+  set +e
+  if ! docker info &>/dev/null; then
+    echo "SKIP docker unavailable"
+    exit 2
+  fi
+
+  src_image_id="$(docker images -q | head -1)"
+  if [[ -z "$src_image_id" ]]; then
+    echo "SKIP no local docker image available to tag as moby/buildkit"
+    exit 2
+  fi
+
+  shape_tag="moby/buildkit:bwtest-shape-$$"
+  if ! docker tag "$src_image_id" "$shape_tag" 2>/dev/null; then
+    echo "SKIP could not tag a throwaway moby/buildkit image"
+    exit 2
+  fi
+
+  shape_cid="$(docker create --entrypoint /bin/true "$shape_tag" 2>/dev/null)"
+  cleanup_shape() {
+    [[ -n "${shape_cid:-}" ]] && docker rm -f "$shape_cid" &>/dev/null
+    docker rmi "$shape_tag" &>/dev/null
+  }
+  if [[ -z "$shape_cid" ]]; then
+    cleanup_shape
+    echo "SKIP could not create a throwaway container from the tagged image"
+    exit 2
+  fi
+
+  cd "$SHAPE_TEST_HOME/project" || { cleanup_shape; exit 1; }
+  # shellcheck disable=SC1090
+  source "$PROJECT_DIR/bw-common.sh"
+  derive_docker_allowlist 2>/dev/null
+
+  if [[ -z "${BW_DOCKER_GUARD_CONFIG:-}" || ! -f "$BW_DOCKER_GUARD_CONFIG" ]]; then
+    cleanup_shape
+    echo "SKIP no config generated"
+    exit 2
+  fi
+
+  ids="$(jq -r '.preowned_containers[]?' "$BW_DOCKER_GUARD_CONFIG")"
+  cleanup_shape
+
+  if ! grep -qx "$shape_cid" <<< "$ids"; then
+    echo "FAIL the throwaway container's full ID was not seeded (got: $ids)"
+    exit 1
+  fi
+
+  # Every id-looking (pure lowercase hex, 12+ chars) entry must be exactly
+  # 64 characters — Docker's full ID length — never the 12-char truncated
+  # form `docker ps` emits by default.
+  bad=0
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if [[ "$entry" =~ ^[0-9a-f]{12,}$ ]] && (( ${#entry} != 64 )); then
+      echo "FAIL truncated id-looking entry in preowned_containers: $entry (${#entry} chars)"
+      bad=1
+    fi
+  done <<< "$ids"
+  (( bad != 0 )) && exit 1
+
+  echo "OK preowned_containers carries full 64-char IDs"
+  exit 0
+)
+shape_test_rc=$?
+case $shape_test_rc in
+  0) ok "preowned_containers seeds full (untruncated) container IDs" ;;
+  2) skip "preowned_containers ID shape" "docker unavailable or setup failed" ;;
+  *) fail "preowned_containers ID shape" "a truncated or otherwise malformed id reached preowned_containers" ;;
+esac
+
+rm -rf "$SHAPE_TEST_HOME"
+
 rm -rf "$BIND_TEST_HOME"
 
 # ============================================================

@@ -361,7 +361,7 @@ derive_docker_allowlist() {
     if [[ -n "$buildkit_image_ids" ]]; then
       while IFS= read -r img_id; do
         [[ -z "$img_id" ]] && continue
-        preowned+="$(docker ps -a --filter "ancestor=$img_id" --format '{{.ID}}' 2>/dev/null)"$'\n'
+        preowned+="$(docker ps -a --no-trunc --filter "ancestor=$img_id" --format '{{.ID}}' 2>/dev/null)"$'\n'
         preowned+="$(docker ps -a --filter "ancestor=$img_id" --format '{{.Names}}' 2>/dev/null)"$'\n'
       done <<<"$buildkit_image_ids"
     fi

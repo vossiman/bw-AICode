@@ -51,12 +51,9 @@ func (t *Tracker) Remove(id string) {
 	delete(t.containers, id)
 }
 
-// isShortContainerID reports whether s could be a Docker short container ID:
-// lowercase hex, at least 12 characters (Docker's short-ID length). Anything
-// shorter or containing a non-hex character is treated as an opaque name,
-// which must match exactly and can never own-by-prefix.
-func isShortContainerID(s string) bool {
-	if len(s) < 12 {
+// isHexRun reports whether s is entirely lowercase hex digits.
+func isHexRun(s string) bool {
+	if s == "" {
 		return false
 	}
 	for _, c := range s {
@@ -67,20 +64,39 @@ func isShortContainerID(s string) bool {
 	return true
 }
 
+// isShortContainerID reports whether s could be a Docker short container ID:
+// lowercase hex, at least 12 characters (Docker's short-ID length). Anything
+// shorter or containing a non-hex character is treated as an opaque name,
+// which must match exactly and can never own-by-prefix.
+func isShortContainerID(s string) bool {
+	return len(s) >= 12 && isHexRun(s)
+}
+
+// isFullContainerID reports whether s is shaped like a genuine Docker full
+// container ID: exactly 64 lowercase hex characters. Only entries with this
+// shape are eligible to be the prefix-match TARGET of a short ID (see
+// idOwnedIn) — restricting the target this way means a short hex query can
+// only ever resolve to a real, daemon-issued container ID, never to a
+// shorter, human-chosen NAME that merely happens to look hex-ish (a crafted
+// 12+ character hex name is a legal Docker name).
+func isFullContainerID(s string) bool {
+	return len(s) == 64 && isHexRun(s)
+}
+
 // idOwnedIn checks id against the given set: an exact match always owns; a
-// short hex ID additionally owns if some full entry in the set starts with
-// it. The reverse (an entry owning by being a prefix of a longer id) is
-// deliberately not supported: without it, a seeded name like
-// "buildx_buildkit_default" would let any extension of that name
-// ("buildx_buildkit_default_evil") resolve as owned, since the extension
-// trivially has the seeded value as a prefix.
+// short hex ID additionally owns if some full-ID-shaped entry (see
+// isFullContainerID) in the set starts with it. The reverse (an entry
+// owning by being a prefix of a longer id) is deliberately not supported:
+// without it, a seeded name like "buildx_buildkit_default" would let any
+// extension of that name ("buildx_buildkit_default_evil") resolve as owned,
+// since the extension trivially has the seeded value as a prefix.
 func idOwnedIn(set map[string]bool, id string) bool {
 	if set[id] {
 		return true
 	}
 	if isShortContainerID(id) {
 		for full := range set {
-			if strings.HasPrefix(full, id) {
+			if isFullContainerID(full) && strings.HasPrefix(full, id) {
 				return true
 			}
 		}
