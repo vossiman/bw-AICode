@@ -353,21 +353,29 @@ func (v *Validator) validateBuild(r *http.Request) Decision {
 		return deny("build is not allowed in read-only mode")
 	}
 
-	// Allow all builds in guarded mode. The real security boundary is
-	// container-create-time validation (image allowlist, volume checks, etc.).
-	// Build-only images may have names that don't match the allowlist exactly
-	// (e.g. docker compose uses <project>-<service> naming).
+	// The resulting tag is the whole point: an unconstrained -t is how a
+	// caller mints an image name that later inherits trust at create time.
+	// Compose build-only services are already in the allowlist as
+	// "<project>-<service>" (bw-common.sh), so real builds pass this.
+	tags := r.URL.Query()["t"]
+	if len(tags) == 0 {
+		return deny("build requires an explicit -t tag so the result can be checked against the allowlist")
+	}
+	for _, tag := range tags {
+		if !v.config.IsImageAllowed(tag) {
+			return deny(fmt.Sprintf("build tag %q is not in the allowlist", tag))
+		}
+	}
+
 	return allow("build allowed")
 }
 
 func (v *Validator) validateImageLoad(r *http.Request) Decision {
-	if v.config.IsReadOnly() {
-		return deny("image load is not allowed in read-only mode")
-	}
-
-	// Image load is used by buildkit to import built images into Docker.
-	// Allowed in guarded mode since we already permit builds.
-	return allow("image load allowed")
+	// A tar carries its own repo-tags, which cannot be checked without
+	// unpacking the stream. That makes /images/load an unconstrained image
+	// minting primitive, the same hole as an untagged build. Denied in every
+	// mode; use --full-docker when a real image import is needed.
+	return deny("image load is not allowed: a tar's tags cannot be checked against the allowlist")
 }
 
 // dockerInfraContainerPrefixes are name prefixes for persistent Docker

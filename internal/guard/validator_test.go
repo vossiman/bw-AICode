@@ -595,48 +595,82 @@ func TestValidateBuildkitContainerActions(t *testing.T) {
 	})
 }
 
-// T3: Build endpoint — all builds allowed in guarded mode, denied in read-only
-func TestValidateBuild(t *testing.T) {
-	v, _ := newTestValidator()
+// T3: Build endpoint — the -t tag must be allowlisted, in every mode.
+//
+// Was TestValidateBuild, which asserted "build with any tag should be
+// allowed in guarded mode". That is CAF-001 step 1: the tag is how the
+// attacker mints an infra-looking image name. Inverted here.
+func TestValidateBuildTagMustBeAllowlisted(t *testing.T) {
+	v, _ := newTestValidator() // allows postgres:16, mcp/postgres, redis:7
 
-	t.Run("build with tag allowed in guarded mode", func(t *testing.T) {
-		r := makeRequest("POST", "/v1.45/build?t=myimage:latest", "")
-		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("build should be allowed in guarded mode, got deny: %s", d.Reason)
+	t.Run("build tagged as an allowlisted image is allowed", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/build?t=postgres:16", "")
+		if d := v.Validate(r); !d.Allow {
+			t.Errorf("allowlisted build tag should be allowed, got deny: %s", d.Reason)
 		}
 	})
 
-	t.Run("build without tag allowed in guarded mode", func(t *testing.T) {
-		r := makeRequest("POST", "/v1.45/build", "")
-		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("build without tag should be allowed in guarded mode, got deny: %s", d.Reason)
+	t.Run("build minting an infra name is denied", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/build?t=moby/buildkit:pwn", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001 step 1: minting moby/buildkit via -t must be denied")
 		}
 	})
 
-	t.Run("build unversioned allowed", func(t *testing.T) {
-		r := makeRequest("POST", "/build?t=myimage:latest", "")
-		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("unversioned build should be allowed in guarded mode, got deny: %s", d.Reason)
-		}
-	})
-
-	t.Run("build with non-allowlisted tag allowed", func(t *testing.T) {
+	t.Run("build with an arbitrary tag is denied", func(t *testing.T) {
 		r := makeRequest("POST", "/v1.45/build?t=custom:dev", "")
-		d := v.Validate(r)
-		if !d.Allow {
-			t.Errorf("build with any tag should be allowed in guarded mode, got deny: %s", d.Reason)
+		if d := v.Validate(r); d.Allow {
+			t.Error("a non-allowlisted build tag must be denied")
+		}
+	})
+
+	t.Run("untagged build is denied", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/build", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("an untagged build produces an uncheckable image and must be denied")
+		}
+	})
+
+	t.Run("every tag is checked, not just the first", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/build?t=postgres:16&t=moby/buildkit:pwn", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("a second, non-allowlisted tag must still be denied")
+		}
+	})
+
+	t.Run("unversioned path is treated the same", func(t *testing.T) {
+		r := makeRequest("POST", "/build?t=custom:dev", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("the /build path without an API version must be checked too")
 		}
 	})
 
 	t.Run("build denied in read-only mode", func(t *testing.T) {
 		rv := newReadOnlyValidator()
-		r := makeRequest("POST", "/v1.45/build?t=myimage:latest", "")
-		d := rv.Validate(r)
-		if d.Allow {
-			t.Errorf("build should be denied in read-only mode")
+		r := makeRequest("POST", "/v1.45/build?t=postgres:16", "")
+		if d := rv.Validate(r); d.Allow {
+			t.Error("build should be denied in read-only mode")
+		}
+	})
+}
+
+func TestValidateImageLoadDenied(t *testing.T) {
+	v, _ := newTestValidator()
+
+	// A tar's embedded repo-tags cannot be checked without unpacking it, so
+	// /images/load is the same minting primitive as an unconstrained build.
+	t.Run("image load denied in guarded mode", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/images/load", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001 step 1: /images/load can mint any tag and must be denied")
+		}
+	})
+
+	t.Run("image load denied in read-only mode", func(t *testing.T) {
+		rv := newReadOnlyValidator()
+		r := makeRequest("POST", "/v1.45/images/load", "")
+		if d := rv.Validate(r); d.Allow {
+			t.Error("image load should be denied in read-only mode")
 		}
 	})
 }
