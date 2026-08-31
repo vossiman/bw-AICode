@@ -206,18 +206,25 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 
 	t.Run("link2_positive_the_exact_pinned_digest_IS_infra", func(t *testing.T) {
 		// Positive control. Every deny above is vacuous if the fixture digest
-		// never matched anything. This also pins the one relaxation infra
-		// trust actually buys: Privileged for the image's OWN entrypoint,
-		// which buildkit genuinely needs. A caller-supplied command under the
-		// same privilege is a separate matter and is denied — see
-		// infra_privilege_does_not_extend_to_a_caller_supplied_command below.
+		// never matched anything, so this pins what a digest match still
+		// buys: the image may be NAMED without being in the allowlist.
+		//
+		// It used to buy more. This subtest previously asserted that a
+		// digest-matched image may be created PRIVILEGED, and that assertion
+		// was itself the hole: the digest pins the image's CONTENT while the
+		// COMMAND stays caller-supplied, so it bought a root shell in a
+		// privileged container behind a public registry digest. Narrowing it
+		// to "no Entrypoint, no Cmd" was not enough either — Healthcheck is
+		// a third caller-supplied command the daemon executes, and its
+		// output comes back through docker inspect. The relaxation is gone
+		// entirely; see infra_digest_does_not_relax_privileged below.
 		ref := "moby/buildkit@" + escapeDigest
 		if !cfg.IsInfraImage(ref) {
 			t.Fatalf("fixture broken: %q is not recognised as infra, so the deny cases above prove nothing", ref)
 		}
-		body := `{"Image": "` + ref + `", "HostConfig": {"Privileged": true}}`
+		body := `{"Image": "` + ref + `", "HostConfig": {}}`
 		if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); !d.Allow {
-			t.Fatalf("regression: real infra image cannot run privileged: %s", d.Reason)
+			t.Fatalf("regression: a digest-matched infra image cannot be created at all: %s", d.Reason)
 		}
 	})
 
@@ -318,44 +325,60 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 		}
 	})
 
-	t.Run("c3_infra_privilege_does_not_extend_to_a_caller_supplied_command", func(t *testing.T) {
-		// CRITICAL 3. The digest pins the image's CONTENT; the caller still
-		// supplies the COMMAND. So the legitimate buildkit image could be
-		// made to run /bin/sh -c … as root in a privileged container — the
-		// exact outcome this branch exists to prevent, reached with a public
-		// registry digest that GET /images/json hands out for free.
+	t.Run("c3_infra_digest_does_not_relax_privileged", func(t *testing.T) {
+		// CRITICAL 3, and the ruling that closed it: a digest-matched infra
+		// image relaxes NOTHING. Privileged is denied for every image.
+		//
+		// The digest pins the image's CONTENT; the COMMAND stays
+		// caller-supplied, so the legitimate buildkit image could be made to
+		// run /bin/sh -c … as root in a privileged container, reached with a
+		// public registry digest that GET /images/json hands out for free.
+		// The first fix required Entrypoint and Cmd to be absent. That was
+		// bypassed by Healthcheck — a third caller-supplied command the
+		// daemon runs, whose output returns through docker inspect, which
+		// this guard permits on an owned container. Commands have more
+		// spellings than a guard can enumerate; the privilege has one.
+		//
+		// The premise the relaxation rested on was false anyway:
+		// bw-common.sh resolves buildkit builders that already exist
+		// HOST-SIDE and seeds them pre-owned, so the guard only ever has to
+		// operate a privileged builder, never create one.
 		infraRef := "moby/buildkit@" + escapeDigest
-		for _, tc := range []struct{ name, extra string }{
-			{"Entrypoint", `"Entrypoint": ["/bin/sh", "-c", "cat /host/etc/shadow"]`},
-			{"Entrypoint as a bare string", `"Entrypoint": "/bin/sh"`},
-			{"Cmd", `"Cmd": ["/bin/sh", "-c", "id"]`},
-			{"Cmd as a bare string", `"Cmd": "/bin/sh"`},
-			{"both", `"Entrypoint": ["/bin/sh"], "Cmd": ["-c", "id"]`},
-		} {
-			body := `{"Image": "` + infraRef + `", ` + tc.extra + `, "HostConfig": {"Privileged": true}}`
-			if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); d.Allow {
-				t.Errorf("CRITICAL 3 open: privileged infra create with a caller-supplied %s allowed", tc.name)
+		cases := []struct{ name, body string }{
+			{"bare privileged", `{"Image": "` + infraRef + `", "HostConfig": {"Privileged": true}}`},
+			{"privileged with an Entrypoint",
+				`{"Image": "` + infraRef + `", "Entrypoint": ["/bin/sh", "-c", "id"], "HostConfig": {"Privileged": true}}`},
+			{"privileged with a Cmd",
+				`{"Image": "` + infraRef + `", "Cmd": ["/bin/sh", "-c", "id"], "HostConfig": {"Privileged": true}}`},
+			{"privileged with a Healthcheck (the bypass of the first fix)",
+				`{"Image": "` + infraRef + `", "Healthcheck": {"Test": ["CMD-SHELL", "echo core >/proc/sys/kernel/core_pattern"], "Interval": 1000000000}, "HostConfig": {"Privileged": true}}`},
+			{"privileged with a Healthcheck and no other command",
+				`{"Image": "` + infraRef + `", "Cmd": null, "Entrypoint": null, "Healthcheck": {"Test": ["CMD", "/bin/sh", "-c", "id"]}, "HostConfig": {"Privileged": true}}`},
+			{"privileged on an ALLOWLISTED image", createBody(`{"Privileged": true}`)},
+		}
+		for _, tc := range cases {
+			d := v.Validate(makeRequest("POST", "/v1.45/containers/create", tc.body))
+			if d.Allow {
+				t.Errorf("CRITICAL 3 open: %s allowed", tc.name)
+			}
+			if !strings.Contains(d.Reason, "privileged") {
+				t.Errorf("%s: denied for the wrong reason (%s); the Privileged check should be what rejects it", tc.name, d.Reason)
 			}
 		}
-		// The same command WITHOUT the privilege relaxation is still denied,
-		// because the image is not allowlisted for ordinary use...
-		body := `{"Image": "` + infraRef + `", "Cmd": ["/bin/sh"], "HostConfig": {"Privileged": true, "Binds": ["/:/host"]}}`
-		if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); d.Allow {
-			t.Error("CRITICAL 3 open: privileged infra create with a command and a host bind allowed")
-		}
-		// ...and an allowlisted, unprivileged image may of course carry a
-		// command. Without this control the denies above could be passing
-		// because Cmd is rejected outright, which would break every create.
-		if d := v.Validate(makeRequest("POST", "/v1.45/containers/create",
-			`{"Image": "postgres:16", "Cmd": ["postgres", "-c", "fsync=off"], "Entrypoint": ["/entry.sh"], "HostConfig": {}}`)); !d.Allow {
-			t.Errorf("regression: an ordinary create with Entrypoint/Cmd denied: %s", d.Reason)
-		}
-		// And the empty spellings the API actually sends must not be read as
-		// "a command was supplied".
-		for _, empty := range []string{`"Cmd": null, "Entrypoint": null`, `"Cmd": [], "Entrypoint": []`, `"Cmd": "", "Entrypoint": ""`} {
-			body := `{"Image": "` + infraRef + `", ` + empty + `, "HostConfig": {"Privileged": true}}`
-			if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); !d.Allow {
-				t.Errorf("regression: infra create with an empty command (%s) denied: %s", empty, d.Reason)
+		// Positive controls. The denies above would be vacuous if commands
+		// were rejected outright, which would break every ordinary create:
+		// an UNPRIVILEGED container may carry any of the three, because
+		// nothing about it is privileged any more.
+		for _, tc := range []struct{ name, body string }{
+			{"Entrypoint and Cmd on an allowlisted image",
+				`{"Image": "postgres:16", "Entrypoint": ["/entry.sh"], "Cmd": ["postgres", "-c", "fsync=off"], "HostConfig": {}}`},
+			{"Healthcheck on an allowlisted image",
+				`{"Image": "postgres:16", "Healthcheck": {"Test": ["CMD-SHELL", "pg_isready"]}, "HostConfig": {}}`},
+			{"an unprivileged infra-digest create",
+				`{"Image": "` + infraRef + `", "HostConfig": {}}`},
+		} {
+			if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", tc.body)); !d.Allow {
+				t.Errorf("regression: %s denied: %s", tc.name, d.Reason)
 			}
 		}
 	})
@@ -368,6 +391,17 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 		// container's lifecycle, not to get a shell inside it — so the exec
 		// and attach routes are closed on pre-owned containers in ALL modes,
 		// not just read-only.
+		//
+		// This covers SEEDED containers only, on purpose. Exec into a
+		// container the session created itself stays allowed, and that is
+		// safe for exactly one reason: no container the session can create
+		// is privileged any more (see infra_digest_does_not_relax_privileged
+		// above). While the infra relaxation existed, the session could
+		// create its OWN privileged buildkit container — owned but not
+		// pre-owned — and exec into that instead, which is why widening this
+		// check was the wrong fix and removing the relaxation was the right
+		// one. If a privileged create ever becomes possible again, this
+		// check is no longer sufficient.
 		for _, id := range []string{"buildx_buildkit_default", seededFullID, seededFullID[:12], seededHexName} {
 			for _, suffix := range []string{"exec", "attach"} {
 				r := makeRequest("POST", "/v1.45/containers/"+id+"/"+suffix, `{}`)

@@ -771,11 +771,29 @@ func TestValidateContainerCreateInfraDigestOnly(t *testing.T) {
 		}
 	})
 
-	t.Run("real infra digest may be privileged", func(t *testing.T) {
+	// Was "real infra digest may be privileged". The infra Privileged
+	// relaxation is gone: the digest pins the image's CONTENT, while the
+	// COMMAND stays caller-supplied through Entrypoint, Cmd or Healthcheck,
+	// so the relaxation was a root shell in a privileged container behind a
+	// public registry digest. It bought nothing real either — bw-common.sh
+	// seeds builders that already exist host-side, so the guard only has to
+	// operate a privileged builder, never create one.
+	t.Run("real infra digest may NOT be privileged", func(t *testing.T) {
 		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {"Privileged": true}}`
 		r := makeRequest("POST", "/v1.45/containers/create", body)
+		if d := v.Validate(r); d.Allow {
+			t.Error("a digest match must not relax Privileged for any image")
+		}
+	})
+
+	t.Run("real infra digest may be created unprivileged", func(t *testing.T) {
+		// The relaxation a digest match still buys: the image may be NAMED
+		// without being in the allowlist. Without this control, the denies
+		// throughout this test would pass vacuously.
+		body := `{"Image": "moby/buildkit@` + digest + `", "HostConfig": {}}`
+		r := makeRequest("POST", "/v1.45/containers/create", body)
 		if d := v.Validate(r); !d.Allow {
-			t.Errorf("digest-pinned buildkit needs privileged, got deny: %s", d.Reason)
+			t.Errorf("a digest-matched infra image must still be creatable: %s", d.Reason)
 		}
 	})
 

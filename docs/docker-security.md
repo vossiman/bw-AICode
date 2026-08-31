@@ -175,9 +175,7 @@ The proxy is **deny-by-default**. Only explicitly modeled operations are allowed
   `--device-cgroup-rule`, `--gpus`, `--volumes-from`, `--security-opt`,
   `--security-opt systempaths=unconfined` (which the CLI sends as empty
   `MaskedPaths`/`ReadonlyPaths` arrays, not as a `SecurityOpt` entry).
-  `Privileged` is rejected too, *unless* the image matches a pinned infra
-  digest **and** the create supplies no `Entrypoint` or `Cmd` — the digest
-  pins the image's content, not the command it is asked to run.
+  **`Privileged` is rejected outright, for every image, with no exception.**
   **Any `HostConfig` field the guard has not explicitly reasoned about is
   denied**, rather than passed through; see "Unknown fields fail closed".
 - **Container lifecycle** (start/stop/restart/kill/attach/wait/resize/exec/rm):
@@ -207,13 +205,23 @@ resolves. Only the latter grants privilege.
 - **Infrastructure images** (`infra_image_digests` in the guard config) are
   matched by content digest, resolved host-side via `docker image inspect`
   at session start, never by name or tag. A digest names content, so a
-  caller cannot mint one by choosing a string. Matching an infra digest
-  relaxes exactly one `HostConfig` field, `Privileged`, and only for a
-  create that supplies no `Entrypoint` and no `Cmd`: the digest pins what
-  the image *is*, while the command stays caller-chosen, and the digest is
-  public (`GET /images/json` returns `RepoDigests`). Every other field
-  (namespaces, capabilities, devices, mounts, `VolumesFrom`,
-  `SecurityOpt`) is still enforced unconditionally, infra image or not.
+  caller cannot mint one by choosing a string. Matching an infra digest now
+  buys exactly one thing: **the image may be named without being in the
+  allowlist.** It relaxes no `HostConfig` field at all.
+
+  It used to relax `Privileged`. That was removed, not repaired. A digest
+  pins what the image *is*, while the command it runs stays caller-chosen —
+  first through `Entrypoint` and `Cmd`, and when those were required to be
+  absent, through `Healthcheck`, which the daemon also executes and whose
+  output comes back through `docker inspect`. Commands have more spellings
+  than a guard can enumerate; the privilege has one. The digest is not a
+  secret either (`GET /images/json` returns `RepoDigests`, and it is a public
+  registry digest regardless), so the relaxation amounted to a root shell in
+  a privileged container for anyone who could read an image list.
+
+  Nothing needed it. `bw-common.sh` resolves buildkit builders that already
+  exist **host-side** and seeds them as pre-owned, so the guard only ever has
+  to *operate* a privileged builder, never create one.
 - **Pre-existing infrastructure containers** are seeded into the ownership
   tracker from a host-side `docker ps` snapshot (`preowned_containers`) at
   startup, matched by full container ID or name — not by a
@@ -256,6 +264,30 @@ bodies captured from a real `docker create` and `docker compose create`
 included), so a list that is too narrow fails the test suite rather than
 the user's build.
 
+### What stops working, plainly
+
+Two of the changes above have costs an operator will hit. Neither is a bug.
+
+**The buildx `docker-container` driver does not work through the guard for
+BUILDS.** That driver builds by exec'ing into the builder container (a real
+build traces four `exec` calls), and `exec` on a host-seeded container is now
+denied in every mode. The builder can still be started, stopped and inspected;
+it just cannot be used to build. The casualty is the workflows that driver
+exists for: **multi-platform builds (`--platform linux/amd64,linux/arm64`) and
+cache export/import (`--cache-to` / `--cache-from`)**. Plain `docker build` and
+`docker compose build` use the default `docker` driver, which goes through
+`POST /build`, and are unaffected. Run a docker-container build outside the
+sandbox, or with `--full-docker`.
+
+**The fail-closed field policy denies flags that used to work.** Today that
+means `--sysctl`, `--runtime`, `--storage-opt` and `--annotation` (all
+`omitempty`, so they only appear in a body when actually used), plus
+`--cidfile`, `--cgroup-parent`, `--volume-driver`, `--link` and the
+address-taking log drivers. **Compose `sysctls:` is common**, so this is the
+one most likely to bite. If a project genuinely needs one, the fix is to add
+it to `hostConfigKnownKeys` with the reasoning, in a reviewed change — not to
+widen the policy.
+
 ### What the guard blocks
 
 | Escape vector | How it's blocked |
@@ -263,7 +295,12 @@ the user's build.
 | Arbitrary volume mount (`-v /:/host`) | Only mounts resolving under the project directory (or `BW_EXTRA_VOLUME_PATHS`) are allowed |
 | Symlink traversal (`-v /project/link-to-root:/host`) | `filepath.EvalSymlinks` resolves before the path check |
 | `Type: volume` mount with an inline bind `DriverConfig` (`{"type":"none","device":"/","o":"bind"}`) | Mount `Type` is default-deny; only `bind` and `tmpfs` pass |
-| Privileged container | `Privileged` rejected unless the image matches a pinned infra digest |
+| Privileged container | `Privileged` rejected for every image, no exception |
+| Command smuggled into a trusted image (`Entrypoint`, `Cmd`, `Healthcheck`) | Nothing the guard can create is privileged, so a command is only ever a command in a confined container |
+| `--security-opt systempaths=unconfined` (empty `MaskedPaths`/`ReadonlyPaths`) | Both fields denied when present as anything but `null` |
+| Raw host block devices via `--device-cgroup-rule` + `mknod` | `DeviceCgroupRules` and `DeviceRequests` denied |
+| Shell in the privileged buildkit builder (`docker exec buildx_buildkit_default sh`) | `exec` and `attach` denied on host-seeded containers in every mode |
+| A `HostConfig` field nobody has reasoned about | Unknown create fields are denied, not passed through |
 | Host PID/network/user/IPC (including `container:<id>` pivot)/cgroup/UTS namespace | Host values rejected for every image, infra included |
 | Arbitrary image | Only allowlisted images pulled or run, or infra images matched by digest |
 | Minting an infra-looking image via build or load | Build tags must be allowlisted (untagged build denied); `/images/load` denied outright |

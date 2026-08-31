@@ -35,10 +35,12 @@ never facts the caller supplies. Behaviour changes an operator will notice:
   is denied. The old model enumerated the dangerous `HostConfig` fields and
   denied those, so every field it had not heard of was permitted — which is
   how the same host escape was found six times. Operator-visible effect:
-  `--sysctl`, `--runtime`, `--storage-opt`, `--annotation`, `--cidfile`,
-  `--cgroup-parent`, `--volume-driver`, `--link` and non-local logging
-  drivers are now denied in guarded mode, and a field added by a future
-  Docker API version is denied until someone reasons about it.
+  **`--sysctl`, `--runtime`, `--storage-opt` and `--annotation` are now
+  denied in guarded mode** (compose `sysctls:` is the common one), along with
+  `--cidfile`, `--cgroup-parent`, `--volume-driver`, `--link` and the
+  address-taking log drivers; and a field added by a future Docker API
+  version is denied until someone reasons about it. If a project needs one,
+  add it to `hostConfigKnownKeys` with the reasoning in a reviewed change.
 - **`--security-opt systempaths=unconfined` is now denied.** The CLI turns
   it into empty `MaskedPaths`/`ReadonlyPaths` arrays plus an empty
   `SecurityOpt`, so the `SecurityOpt` check never saw it; an empty array
@@ -48,17 +50,29 @@ never facts the caller supplies. Behaviour changes an operator will notice:
   already denied, but `CAP_MKNOD` is in Docker's default capability set, so
   the device cgroup was the only barrier left between a container and the
   host's raw block devices.
-- **A pinned infra digest no longer permits a caller-supplied command.** A
-  privileged create from a digest-matched infra image must run the image's
-  own entrypoint: `Entrypoint` and `Cmd` must be absent. The digest pins the
-  image's content, not what it is asked to do, and it is public.
+- **Privileged containers are now denied outright, for every image.** A
+  pinned infra digest no longer relaxes `Privileged`; it now buys only the
+  right to name the image without allowlisting it. The digest pins the
+  image's CONTENT while the COMMAND stays caller-supplied — through
+  `Entrypoint`, `Cmd`, and also `Healthcheck`, which the daemon executes and
+  whose output comes back through `docker inspect` — so the relaxation
+  amounted to a root shell in a privileged container behind a digest that
+  `GET /images/json` hands out for free. Nothing needed it: `bw-common.sh`
+  seeds buildkit builders that already exist host-side, so the guard only
+  has to operate a privileged builder, never create one.
 - **`exec` and `attach` on host-seeded containers are denied in every
   mode.** Seeding exists so a session can manage buildkit's lifecycle; that
   container runs privileged, so a shell inside it was a host escape needing
   no create call at all. Lifecycle actions (start/stop/wait) and inspect
-  still work. Note this makes the buildx `docker-container` driver unusable
-  through the guard, since it builds by exec'ing into the builder; the
-  default `docker` driver (`POST /build`) is unaffected.
+  still work.
+- **Consequence, stated plainly: the buildx `docker-container` driver no
+  longer works through the guard for BUILDS.** It builds by exec'ing into
+  the builder container (a real build traces four `exec` calls). The
+  casualties are multi-platform builds (`--platform linux/amd64,linux/arm64`)
+  and cache export/import (`--cache-to` / `--cache-from`). Plain
+  `docker build` and `docker compose build` use the default `docker` driver
+  and `POST /build`, and are unaffected. Use `--full-docker`, or build
+  outside the sandbox, when you need the container driver.
 
 See `docs/docker-security.md` for the full accounting, including the
 residuals that remain open (named-volume binds, host-wide volume-name

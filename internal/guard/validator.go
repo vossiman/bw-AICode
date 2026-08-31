@@ -97,12 +97,7 @@ type hostConfigFields struct {
 
 // containerCreateRequest is the subset of fields we inspect from container create.
 type containerCreateRequest struct {
-	Image string `json:"Image"`
-	// Entrypoint and Cmd are RawMessage because the API accepts both a
-	// string and a string array for each. Only their emptiness matters here
-	// (see the infra-trust check in validateContainerCreate).
-	Entrypoint json.RawMessage  `json:"Entrypoint"`
-	Cmd        json.RawMessage  `json:"Cmd"`
+	Image      string           `json:"Image"`
 	HostConfig hostConfigFields `json:"HostConfig"`
 }
 
@@ -115,11 +110,21 @@ type containerCreateRequest struct {
 var createKnownKeys = map[string]bool{
 	"Image":      true, // checked against the image allowlist
 	"HostConfig": true, // checked field by field, below
-	"Entrypoint": true, // checked when infra digest trust is in play
-	"Cmd":        true, // checked when infra digest trust is in play
 
 	// Container-internal process configuration. Every one of these is
 	// confined to the container's own namespaces.
+	//
+	// Entrypoint, Cmd and Healthcheck are all caller-supplied commands the
+	// daemon runs inside the container, and they are permitted because
+	// nothing about the container is privileged: Privileged is denied for
+	// every image, so a command is only ever a command in a confined
+	// container. That is precisely why the infra Privileged relaxation had
+	// to go rather than grow a per-field command check — Healthcheck was a
+	// third spelling nobody had counted, and there is no reason to think it
+	// was the last.
+	"Entrypoint":   true,
+	"Cmd":          true,
+	"Healthcheck":  true,
 	"Hostname":     true, // container's own hostname
 	"Domainname":   true, // container's own domain
 	"User":         true, // uid/gid inside the container
@@ -132,7 +137,6 @@ var createKnownKeys = map[string]bool{
 	"Env":          true, // environment of the container process
 	"Labels":       true, // metadata only
 	"WorkingDir":   true, // path inside the container
-	"Healthcheck":  true, // a command run inside the container
 	"ArgsEscaped":  true, // Windows arg quoting flag
 	"StopSignal":   true, // signal name
 	"StopTimeout":  true, // seconds
@@ -415,8 +419,19 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	}
 
 	// Infra images are matched by content digest (see config.IsInfraImage).
-	// Infra trust relaxes exactly one field, Privileged, because buildkit
-	// genuinely requires it. Every other HostConfig check below still runs.
+	// A digest match now buys exactly ONE thing: the image may be named at
+	// all, without being in the allowlist. It relaxes NO HostConfig field.
+	//
+	// It used to relax Privileged, on the premise that real buildkit had to
+	// be created through the guard. That premise is false: bw-common.sh
+	// resolves builders that already exist HOST-SIDE and seeds them as
+	// pre-owned, so the guard only ever has to OPERATE a privileged builder,
+	// never create one. The relaxation could not be made safe either — the
+	// digest pins the image's CONTENT while the COMMAND stays
+	// caller-supplied, and a command has more spellings than the guard can
+	// enumerate (Entrypoint, Cmd, and Healthcheck, which the daemon also
+	// executes and whose output comes back through docker inspect). Denying
+	// Privileged outright is the check that has no spellings.
 	infraImage := !v.config.IsReadOnly() && v.config.IsInfraImage(req.Image)
 	if !v.config.IsImageAllowed(req.Image) && !infraImage {
 		return deny(fmt.Sprintf("image %q is not in the allowlist", req.Image))
@@ -471,23 +486,11 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 		}
 	}
 
-	// Check privileged mode.
-	//
-	// Infra digest trust pins the image's CONTENT, never the COMMAND: the
-	// caller still supplies Entrypoint and Cmd. Without the check below,
-	// {"Image":"moby/buildkit@sha256:<pinned>","Entrypoint":["/bin/sh","-c",…],
-	// "HostConfig":{"Privileged":true}} was allowed — the legitimate image
-	// running arbitrary code as root in a privileged container, which is
-	// exactly what this guard exists to prevent. The digest is not a secret
-	// either: GET /images/json is a global read and returns RepoDigests.
-	// So the relaxation applies only to the image's OWN entrypoint.
+	// Check privileged mode. NO image relaxes this, digest-matched infra
+	// included: see the infraImage comment above for why the relaxation was
+	// removed rather than repaired.
 	if req.HostConfig.Privileged {
-		if !infraImage {
-			return deny("privileged containers are not allowed")
-		}
-		if !isEmptyJSON(req.Entrypoint) || !isEmptyJSON(req.Cmd) {
-			return deny("a privileged infra image must run its own entrypoint: Entrypoint and Cmd must be absent")
-		}
+		return deny("privileged containers are not allowed")
 	}
 
 	// Check PidMode. "host" joins the host pid namespace directly; a
@@ -615,14 +618,6 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	}
 
 	return allow("container create allowed")
-}
-
-// isEmptyJSON reports whether a RawMessage is absent or carries no content:
-// missing, null, an empty array, or an empty string. Entrypoint and Cmd may
-// each be either a string or a string array in the Docker API.
-func isEmptyJSON(raw json.RawMessage) bool {
-	s := strings.TrimSpace(string(raw))
-	return s == "" || s == "null" || s == "[]" || s == `""`
 }
 
 // checkKnownKeys enforces the fail-closed field policy on a container-create

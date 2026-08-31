@@ -521,11 +521,21 @@ fi
 # ReadonlyPaths: [], and sends an EMPTY SecurityOpt array, so the guard's
 # SecurityOpt check never sees it. An empty array replaces the daemon's
 # defaults: /proc/sys loses its read-only bind, and core_pattern is
-# host-global. The probe only TESTS writability, it does not write.
-output="$(docker_via_guard run --rm --security-opt systempaths=unconfined alpine \
-  sh -c 'test -w /proc/sys/kernel/core_pattern && echo ESCAPED' 2>&1 || true)"
+# host-global.
+#
+# The probe does NOT use `test -w`: root's DAC check passes on core_pattern
+# even under the read-only bind, so `test -w` reports writable in a perfectly
+# confined container (verified on docker 29.7.2) and would only be testing
+# whether the container ran at all. Two things actually discriminate, and both
+# are checked: the read-only bind is visible in /proc/mounts (it disappears
+# entirely under the attack), and a write really succeeds. The write is a
+# write-BACK of the value already there, so it changes nothing on the host.
+output="$(docker_via_guard run --rm --security-opt systempaths=unconfined alpine sh -c '
+  grep -q " /proc/sys proc ro," /proc/mounts || echo ESCAPED_NO_RO_BIND
+  cat /proc/sys/kernel/core_pattern > /tmp/v 2>/dev/null &&
+    (cat /tmp/v > /proc/sys/kernel/core_pattern) 2>/dev/null && echo ESCAPED_WRITABLE' 2>&1 || true)"
 if echo "$output" | grep -q "ESCAPED"; then
-  fail "guarded: --security-opt systempaths=unconfined" "/proc/sys became writable (host escape)"
+  fail "guarded: --security-opt systempaths=unconfined" "/proc/sys lost its read-only bind (host escape): $output"
 else
   ok "guarded: --security-opt systempaths=unconfined blocked"
 fi
