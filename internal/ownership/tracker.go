@@ -9,7 +9,8 @@ import (
 // (created through it or belonging to the compose project).
 type Tracker struct {
 	mu         sync.RWMutex
-	containers map[string]bool // full container IDs
+	containers map[string]bool // full container IDs and names
+	preowned   map[string]bool // subset of containers seeded host-side (infra), not created this session
 	networks   map[string]bool // full network IDs
 	execIDs    map[string]bool // exec instance IDs
 }
@@ -17,6 +18,7 @@ type Tracker struct {
 func New() *Tracker {
 	return &Tracker{
 		containers: make(map[string]bool),
+		preowned:   make(map[string]bool),
 		networks:   make(map[string]bool),
 		execIDs:    make(map[string]bool),
 	}
@@ -31,9 +33,15 @@ func (t *Tracker) Add(id string) {
 // Seed marks containers as owned without them having been created through
 // this session. Used for persistent Docker infrastructure containers whose
 // IDs are resolved host-side at startup, never from caller-supplied names.
+// Seeded containers are also recorded as "preowned" so callers can apply
+// stricter rules to them (e.g. denying access in read-only mode) that don't
+// apply to containers this session actually created.
 func (t *Tracker) Seed(ids []string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for _, id := range ids {
-		t.Add(id)
+		t.containers[id] = true
+		t.preowned[id] = true
 	}
 }
 
@@ -43,24 +51,76 @@ func (t *Tracker) Remove(id string) {
 	delete(t.containers, id)
 }
 
-// IsOwned checks if the given ID (full or short) matches any owned container.
-func (t *Tracker) IsOwned(id string) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+// isShortContainerID reports whether s could be a Docker short container ID:
+// lowercase hex, at least 12 characters (Docker's short-ID length). Anything
+// shorter or containing a non-hex character is treated as an opaque name,
+// which must match exactly and can never own-by-prefix.
+func isShortContainerID(s string) bool {
+	if len(s) < 12 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
 
-	// Docker container IDs and names: check containers map
-	// Exact match first
-	if t.containers[id] {
+// idOwnedIn checks id against the given set: an exact match always owns; a
+// short hex ID additionally owns if some full entry in the set starts with
+// it. The reverse (an entry owning by being a prefix of a longer id) is
+// deliberately not supported: without it, a seeded name like
+// "buildx_buildkit_default" would let any extension of that name
+// ("buildx_buildkit_default_evil") resolve as owned, since the extension
+// trivially has the seeded value as a prefix.
+func idOwnedIn(set map[string]bool, id string) bool {
+	if set[id] {
 		return true
 	}
+	if isShortContainerID(id) {
+		for full := range set {
+			if strings.HasPrefix(full, id) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
-	// Prefix match: Docker uses 12-char short IDs
-	for full := range t.containers {
-		if strings.HasPrefix(full, id) || strings.HasPrefix(id, full) {
+// prefixOwnedIn is the network-ID equivalent of idOwnedIn, without the
+// container-specific hex/length shape restriction (network short-ID prefixes
+// in this codebase aren't constrained to Docker's hex ID format). Like
+// idOwnedIn, only the forward direction is supported: a query never owns a
+// stored value merely by being its extension.
+func prefixOwnedIn(set map[string]bool, id string) bool {
+	if set[id] {
+		return true
+	}
+	for full := range set {
+		if strings.HasPrefix(full, id) {
 			return true
 		}
 	}
 	return false
+}
+
+// IsOwned checks if the given ID (full or short) matches any owned container,
+// whether created through this session or seeded host-side.
+func (t *Tracker) IsOwned(id string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return idOwnedIn(t.containers, id)
+}
+
+// IsPreowned reports whether id matches a container that was seeded
+// host-side (via Seed) rather than created through this session. Used to
+// apply stricter rules to infra containers, such as denying access to them
+// in read-only mode even though they are otherwise "owned".
+func (t *Tracker) IsPreowned(id string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return idOwnedIn(t.preowned, id)
 }
 
 // AddExecID tracks exec instances.
@@ -88,17 +148,7 @@ func (t *Tracker) RemoveNetwork(id string) {
 func (t *Tracker) IsNetworkOwned(id string) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-
-	if t.networks[id] {
-		return true
-	}
-
-	for full := range t.networks {
-		if strings.HasPrefix(full, id) || strings.HasPrefix(id, full) {
-			return true
-		}
-	}
-	return false
+	return prefixOwnedIn(t.networks, id)
 }
 
 // IsExecOwned checks if an exec instance was created through this proxy.

@@ -350,9 +350,22 @@ derive_docker_allowlist() {
       infra_digests_json="$(printf '%s\n' "$buildkit_digests" | jq -R . | jq -s 'map(select(. != ""))')"
     fi
 
-    local preowned
-    preowned="$(docker ps -a --filter 'name=^buildx_buildkit_' \
-      --format '{{.Names}}' 2>/dev/null | sort -u)"
+    # Resolve pre-owned containers by IMAGE, not by name: a name filter would
+    # promote any container a caller (or a prior/sibling session) happened to
+    # name "buildx_buildkit_*" to infra status. Image IDs are content
+    # addresses the caller cannot mint, the same digest-over-name principle
+    # as InfraImageDigests above. Seed both the container's full ID and its
+    # name so a request addressed either way resolves.
+    local buildkit_image_ids preowned=""
+    buildkit_image_ids="$(docker images -q moby/buildkit 2>/dev/null | sort -u)"
+    if [[ -n "$buildkit_image_ids" ]]; then
+      while IFS= read -r img_id; do
+        [[ -z "$img_id" ]] && continue
+        preowned+="$(docker ps -a --filter "ancestor=$img_id" --format '{{.ID}}' 2>/dev/null)"$'\n'
+        preowned+="$(docker ps -a --filter "ancestor=$img_id" --format '{{.Names}}' 2>/dev/null)"$'\n'
+      done <<<"$buildkit_image_ids"
+    fi
+    preowned="$(printf '%s' "$preowned" | sort -u)"
     if [[ -n "$preowned" ]]; then
       preowned_json="$(printf '%s\n' "$preowned" | jq -R . | jq -s 'map(select(. != ""))')"
     fi

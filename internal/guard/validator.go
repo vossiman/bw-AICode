@@ -306,6 +306,24 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	return allow("container create allowed")
 }
 
+// checkContainerUsable returns a non-nil deny Decision if containerID may
+// not be acted on: either it isn't owned at all, or it is owned only because
+// it was seeded host-side (infrastructure, e.g. buildkit) and the session is
+// in read-only mode. Read-only mode never grants access to infra containers,
+// even though they are otherwise "owned" for ordinary sessions — this is the
+// floor the old isDockerInfraContainer name check used to enforce.
+func (v *Validator) checkContainerUsable(containerID string) *Decision {
+	if !v.tracker.IsOwned(containerID) {
+		d := deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+		return &d
+	}
+	if v.config.IsReadOnly() && v.tracker.IsPreowned(containerID) {
+		d := deny(fmt.Sprintf("container %q is Docker infrastructure and read-only mode blocks all actions on it", containerID))
+		return &d
+	}
+	return nil
+}
+
 func (v *Validator) validateContainerAction(path string) Decision {
 	matches := ReContainerAction.FindStringSubmatch(path)
 	if matches == nil {
@@ -314,8 +332,8 @@ func (v *Validator) validateContainerAction(path string) Decision {
 	containerID := matches[2]
 	action := matches[3]
 
-	if !v.tracker.IsOwned(containerID) {
-		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+	if d := v.checkContainerUsable(containerID); d != nil {
+		return *d
 	}
 
 	return allow(fmt.Sprintf("container %s allowed", action))
@@ -328,8 +346,8 @@ func (v *Validator) validateContainerDelete(path string) Decision {
 	}
 	containerID := matches[2]
 
-	if !v.tracker.IsOwned(containerID) {
-		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+	if d := v.checkContainerUsable(containerID); d != nil {
+		return *d
 	}
 
 	return allow("container delete allowed")
@@ -342,8 +360,8 @@ func (v *Validator) validateContainerExec(r *http.Request) Decision {
 	}
 	containerID := matches[2]
 
-	if !v.tracker.IsOwned(containerID) {
-		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+	if d := v.checkContainerUsable(containerID); d != nil {
+		return *d
 	}
 
 	bodyBytes, err := readBody(r)
@@ -463,8 +481,8 @@ func (v *Validator) validateContainerAccess(path string, re *regexp.Regexp, oper
 	}
 	containerID := matches[2]
 
-	if !v.tracker.IsOwned(containerID) {
-		return deny(fmt.Sprintf("container %q is not owned by this session", containerID))
+	if d := v.checkContainerUsable(containerID); d != nil {
+		return *d
 	}
 
 	return allow(fmt.Sprintf("container %s allowed", operation))

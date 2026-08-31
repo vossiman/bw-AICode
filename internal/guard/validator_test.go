@@ -684,6 +684,88 @@ func TestBuildkitPrefixGrantsNothing(t *testing.T) {
 			t.Error("starting an unowned container should be denied")
 		}
 	})
+
+	// C1 (fix round 1): an extension of a seeded name must not inherit its
+	// ownership. The old bidirectional prefix match let
+	// "buildx_buildkit_default_evil" resolve as owned because it starts
+	// with the seeded "buildx_buildkit_default".
+	t.Run("extension of a seeded name is denied", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/containers/buildx_buildkit_default_evil/start", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("CAF-001 C1: an extension of a seeded container name must not be owned")
+		}
+	})
+}
+
+// I1 (fix round 1): bw-common.sh now seeds both the container's full ID and
+// its name, so a request addressed either way must resolve to the same
+// seeded container.
+func TestSeededContainerResolvesByFullAndShortID(t *testing.T) {
+	fullID := strings.Repeat("a1", 32) // 64-char hex, Docker's full ID length
+	shortID := fullID[:12]
+
+	cfg := &config.Config{
+		ProjectDir:         "/project",
+		AllowedImages:      []string{"postgres:16"},
+		VolumeMountRoot:    "/project",
+		PreownedContainers: []string{fullID, "buildx_buildkit_default"},
+	}
+	tracker := ownership.New()
+	tracker.Seed(cfg.PreownedContainers)
+	v := NewValidator(cfg, tracker)
+
+	t.Run("resolves by full ID", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/containers/"+fullID+"/start", "")
+		if d := v.Validate(r); !d.Allow {
+			t.Errorf("a request by the seeded full ID should be allowed, got deny: %s", d.Reason)
+		}
+	})
+
+	t.Run("resolves by short ID", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/containers/"+shortID+"/start", "")
+		if d := v.Validate(r); !d.Allow {
+			t.Errorf("a request by the seeded container's short ID should be allowed, got deny: %s", d.Reason)
+		}
+	})
+}
+
+// C2 (fix round 1): read-only mode must deny actions on infra (preowned)
+// containers regardless of ownership. The old isDockerInfraContainer check
+// enforced this floor explicitly; the seeding-based replacement dropped it,
+// which would have let a read-only session exec into a seeded buildkit
+// container. Calls the unexported validate methods directly so the read-only
+// floor inside checkContainerUsable is exercised even though Validate's
+// blanket read-only gate would also catch this case for POST/DELETE methods.
+func TestReadOnlyDeniesPreownedContainerActions(t *testing.T) {
+	cfg := &config.Config{
+		ProjectDir:         "/project",
+		AllowedImages:      []string{}, // empty = read-only
+		VolumeMountRoot:    "/project",
+		PreownedContainers: []string{"buildx_buildkit_default"},
+	}
+	tracker := ownership.New()
+	tracker.Seed(cfg.PreownedContainers)
+	v := NewValidator(cfg, tracker)
+
+	t.Run("checkContainerUsable denies a preowned container in read-only mode", func(t *testing.T) {
+		if d := v.checkContainerUsable("buildx_buildkit_default"); d == nil || d.Allow {
+			t.Error("CAF-001 C2: read-only mode must deny actions on a preowned infra container")
+		}
+	})
+
+	t.Run("exec create denies via the internal validator", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/containers/buildx_buildkit_default/exec", `{}`)
+		if d := v.validateContainerExec(r); d.Allow {
+			t.Error("CAF-001 C2: exec on a preowned container must be denied in read-only mode")
+		}
+	})
+
+	t.Run("end-to-end via Validate is also denied", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/containers/buildx_buildkit_default/exec", `{}`)
+		if d := v.Validate(r); d.Allow {
+			t.Error("read-only mode should deny exec end-to-end")
+		}
+	})
 }
 
 // T3: Build endpoint — the -t tag must be allowlisted, in every mode.
