@@ -5,19 +5,24 @@ on:
     branches: [main]
   pull_request:
 
+# This workflow only checks out and tests. Default token scope is broader
+# than that, so it is narrowed here at workflow level; every job inherits it.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
 
       # Type stripping for hooks/bw-deny-files.ts, so node --test can import
       # the extension directly rather than through a build step.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
 
@@ -36,3 +41,22 @@ jobs:
       # the installer's output — so it has to be a machine check.
       - name: Installer hook ownership
         run: test/install_hooks_test.sh
+
+      # Actually RUNS the guard's integration suite instead of only
+      # syntax-checking it above. This is what exercises Test 0b (the
+      # compose-harvest regression gate) and Test 0c (--no-trunc container-ID
+      # seeding against a real daemon) — neither ran in CI before. Individual
+      # subtests SKIP (exit 2) when Docker or a needed image is missing;
+      # ubuntu-latest ships Docker, so this should not skip, but a silent
+      # skip is nearly as bad as no test, so the skip count is surfaced as a
+      # workflow warning rather than swallowed.
+      - name: Docker guard integration tests
+        run: |
+          set -o pipefail
+          bash test/integration_test.sh | tee /tmp/integration_test.log
+          summary="$(grep -E '^=== Results:' /tmp/integration_test.log || true)"
+          echo "$summary"
+          skipped="$(grep -oE '[0-9]+ skipped' /tmp/integration_test.log | grep -oE '^[0-9]+' || echo 0)"
+          if [ "${skipped:-0}" -gt 0 ]; then
+            echo "::warning::$skipped integration test(s) SKIPPED (Docker or a required image was unavailable) — this run did not exercise them"
+          fi
