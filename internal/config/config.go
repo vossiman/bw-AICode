@@ -32,6 +32,11 @@ type Config struct {
 	AllowedNetworks    []string `json:"allowed_networks"`
 	VolumeMountRoot    string   `json:"volume_mount_root"`
 	AllowedVolumePaths []string `json:"allowed_volume_paths"`
+	// InfraImageDigests are exact content digests ("sha256:...") of Docker's
+	// own infrastructure images (buildkit). Resolved host-side by
+	// bw-common.sh, never from project-controlled input. A digest names
+	// content, so unlike a name it cannot be minted by the caller.
+	InfraImageDigests []string `json:"infra_image_digests"`
 }
 
 // IsReadOnly returns true if no images are allowed (read-only mode).
@@ -60,6 +65,35 @@ func imageNameOnly(image string) string {
 // the image name (e.g. "docker.io/moby/buildkit:v0.12" -> "moby/buildkit").
 func NormalizeImageName(image string) string {
 	return imageNameOnly(normalizeImage(image))
+}
+
+// imageDigest returns the digest portion of an image reference
+// ("moby/buildkit@sha256:abc" -> "sha256:abc"), or "" if there is none.
+func imageDigest(image string) string {
+	if i := strings.Index(image, "@"); i != -1 {
+		return image[i+1:]
+	}
+	return ""
+}
+
+// IsInfraImage reports whether the reference carries an explicit content
+// digest that exactly matches a host-resolved infrastructure digest.
+//
+// Deliberately strict: a reference without a digest is never infra, however
+// closely its name resembles one. This is the CAF-001 fix: the old
+// name-based check let a caller mint "moby/buildkit:anything" and inherit
+// infrastructure trust.
+func (c *Config) IsInfraImage(image string) bool {
+	digest := imageDigest(image)
+	if digest == "" {
+		return false
+	}
+	for _, allowed := range c.InfraImageDigests {
+		if digest == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // IsImageAllowed checks if the given image is in the allowlist.

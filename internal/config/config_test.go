@@ -291,3 +291,50 @@ func TestLoadResolvesVolumeMountRoot(t *testing.T) {
 		t.Errorf("VolumeMountRoot = %q, want %q (resolved symlink)", cfg.VolumeMountRoot, realDir)
 	}
 }
+
+func TestIsInfraImageRequiresExactDigest(t *testing.T) {
+	realDigest := "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	cfg := &Config{
+		ProjectDir:        "/project",
+		AllowedImages:     []string{"postgres:16"},
+		InfraImageDigests: []string{realDigest},
+	}
+
+	t.Run("exact digest matches", func(t *testing.T) {
+		if !cfg.IsInfraImage("moby/buildkit@" + realDigest) {
+			t.Error("an image carrying the pinned digest should be infra")
+		}
+	})
+
+	t.Run("registry prefix does not defeat the match", func(t *testing.T) {
+		if !cfg.IsInfraImage("docker.io/moby/buildkit@" + realDigest) {
+			t.Error("docker.io prefix should not change the digest match")
+		}
+	})
+
+	t.Run("self-minted tag with the infra NAME is not infra", func(t *testing.T) {
+		if cfg.IsInfraImage("moby/buildkit:pwn") {
+			t.Error("CAF-001: a caller-chosen tag on the infra name must not be infra")
+		}
+	})
+
+	t.Run("bare infra name is not infra", func(t *testing.T) {
+		if cfg.IsInfraImage("moby/buildkit") {
+			t.Error("a name without a digest must not be infra")
+		}
+	})
+
+	t.Run("wrong digest is not infra", func(t *testing.T) {
+		other := "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+		if cfg.IsInfraImage("moby/buildkit@" + other) {
+			t.Error("an unpinned digest must not be infra")
+		}
+	})
+
+	t.Run("empty digest list means nothing is infra", func(t *testing.T) {
+		empty := &Config{ProjectDir: "/project"}
+		if empty.IsInfraImage("moby/buildkit@" + realDigest) {
+			t.Error("with no pinned digests nothing may be infra")
+		}
+	})
+}
