@@ -161,37 +161,130 @@ The proxy is **deny-by-default**. Only explicitly modeled operations are allowed
   the route list is not the control here. Closing any of this requires
   **ownership-filtered response bodies**, which the guard does not do today:
   it validates requests and forwards responses untouched.
-- **Container create**: image must be in allowlist, volume mounts must be under project directory (symlink-resolved), dangerous flags blocked (`--privileged`, `--pid=host`, `--network=host`, `--userns=host`, `--ipc=host`, `--cgroupns=host`, `--uts=host`, `--cap-add`, `--device`, `--volumes-from`, `--security-opt`)
-- **Container lifecycle** (start/stop/restart/kill/attach/wait/logs/resize/exec/rm): only on containers owned by this session (created through the proxy or belonging to the compose project)
-- **Image pull**: only allowlisted images
-- **Build**: unconditionally blocked (use `--full-docker` if builds are needed)
-- **Network create/delete**: only allowlisted networks
+- **Container create**: image must be in the allowlist, or match an
+  infrastructure image by content **digest** (see "Two kinds of trust"
+  below). Mount `Type` is default-deny: only a validated `bind` (path must
+  resolve, symlinks included, under the project directory or an operator-set
+  extra path) and a harmless `tmpfs` are permitted — `volume`, `npipe`,
+  `cluster`, and a `volume`-typed mount carrying an inline bind
+  `DriverConfig` are all rejected. Dangerous flags are rejected
+  unconditionally, for every image including infra images:
+  `--pid=host`, `--network=host`, `--userns=host`, `--ipc=host`
+  (including `container:<id>` pivoting to a host-namespaced container),
+  `--cgroupns=host`, `--uts=host`, `--cap-add`, `--device`,
+  `--volumes-from`, `--security-opt`. `Privileged` is rejected too, *unless*
+  the image matches a pinned infra digest, in which case that one field
+  relaxes because real buildkit requires it.
+- **Container lifecycle** (start/stop/restart/kill/attach/wait/resize/exec/rm):
+  only on containers owned by this session — ownership comes from containers
+  created through the proxy, plus a host-side `docker ps` snapshot seeded at
+  session start (`preowned_containers`), matched on full container ID or
+  name. There is no name-prefix shortcut.
+- **Image pull**: only allowlisted images, or an infra image matched by
+  digest.
+- **Build**: requires every `-t` tag to be in the allowlist; an untagged
+  build is denied outright, because an untagged result can't be checked.
+  `/images/load` is denied in every mode: a loaded tar carries its own
+  repo-tags, which can't be checked without unpacking the stream, so it is
+  an unconstrained image-minting primitive with no cheaper fix than denial.
+  Use `--full-docker` if you genuinely need either.
+- **Network create/delete**: only allowlisted networks.
 - **Everything else**: blocked (Swarm, secrets, plugins, volume create, etc.)
+
+### Two kinds of trust, and why
+
+The guard distinguishes facts the **caller** supplies from facts the **host**
+resolves. Only the latter grants privilege.
+
+- **Infrastructure images** (`infra_image_digests` in the guard config) are
+  matched by content digest, resolved host-side via `docker image inspect`
+  at session start, never by name or tag. A digest names content, so a
+  caller cannot mint one by choosing a string. Matching an infra digest
+  relaxes exactly one `HostConfig` field, `Privileged`; every other field
+  (namespaces, capabilities, devices, mounts, `VolumesFrom`,
+  `SecurityOpt`) is still enforced unconditionally, infra image or not.
+- **Pre-existing infrastructure containers** are seeded into the ownership
+  tracker from a host-side `docker ps` snapshot (`preowned_containers`) at
+  startup, matched by full container ID or name — not by a
+  `buildx_buildkit_`-style name prefix a caller could reproduce.
+- **Bind mount paths outside the project directory** come only from the
+  operator's own `BW_EXTRA_VOLUME_PATHS` environment variable
+  (colon-separated, set in the host shell that launches the sandbox, never
+  read from the project). They are no longer harvested from the project's
+  `docker-compose.yml`, because the project directory is the untrusted
+  input the guard exists to constrain. An explicit `-v` naming a Docker
+  socket path is refused even when the caller lists it, and even when it
+  falls inside an otherwise-allowed path.
 
 ### What the guard blocks
 
 | Escape vector | How it's blocked |
 |---|---|
-| Arbitrary volume mount (`-v /:/host`) | Only mounts under project directory allowed (symlink-resolved) |
-| Symlink traversal (`-v /project/link-to-root:/host`) | `filepath.EvalSymlinks` resolves before path check |
-| Privileged container | `Privileged` flag rejected in request body |
-| Host PID/network namespace | `PidMode: host`, `NetworkMode: host` rejected |
-| Host user/IPC/cgroup/UTS namespace | `UsernsMode`, `IpcMode`, `CgroupnsMode`, `UTSMode` host values rejected |
-| Arbitrary image | Only allowlisted images can be pulled or used |
-| Capability escalation | `CapAdd` rejected |
-| Device access | `Devices` rejected |
-| Volume inheritance | `VolumesFrom` rejected |
-| Security option override | `SecurityOpt` rejected |
-| Docker build | `/build` unconditionally blocked |
-| Exec into non-project container | Container ownership tracking |
-| Docker/Podman socket in container | Socket paths detected by basename and known absolute paths |
-| Oversized request body | 10 MB body size limit on all write requests |
+| Arbitrary volume mount (`-v /:/host`) | Only mounts resolving under the project directory (or `BW_EXTRA_VOLUME_PATHS`) are allowed |
+| Symlink traversal (`-v /project/link-to-root:/host`) | `filepath.EvalSymlinks` resolves before the path check |
+| `Type: volume` mount with an inline bind `DriverConfig` (`{"type":"none","device":"/","o":"bind"}`) | Mount `Type` is default-deny; only `bind` and `tmpfs` pass |
+| Privileged container | `Privileged` rejected unless the image matches a pinned infra digest |
+| Host PID/network/user/IPC (including `container:<id>` pivot)/cgroup/UTS namespace | Host values rejected for every image, infra included |
+| Arbitrary image | Only allowlisted images pulled or run, or infra images matched by digest |
+| Minting an infra-looking image via build or load | Build tags must be allowlisted (untagged build denied); `/images/load` denied outright |
+| Capability escalation, devices, volumes-from, security-opt | Rejected for every image, infra included |
+| Exec into a non-project container | Ownership tracking, seeded host-side, no name-prefix exemption |
+| Cross-container file read (`/containers/{id}/archive`, `/logs`, `/stats`, …) | Per-container reads require the same ownership check writes use |
+| Docker/Podman socket in container | Socket paths denied by basename and absolute path, ahead of any explicit allowlist entry |
+| Oversized request body | 10 MB limit on write requests |
 
 ### What it doesn't protect against
 
-- Supply-chain attacks (malicious upstream MCP images)
-- Network exfiltration from allowed containers (same risk as the AI tool itself having network access)
-- Bugs in the proxy implementation (mitigated by deny-by-default and comprehensive tests)
+- Supply-chain attacks (malicious upstream images that are legitimately allowlisted)
+- Network exfiltration from allowed containers (the same risk as the AI tool
+  having network access at all)
+- Anything reachable through an allowlisted container's own privileges
+- Bugs in the proxy implementation. This is a filtering proxy, not a kernel
+  boundary. It was rewritten in 2026-08 after an audit (CAF-001) found a
+  three-step host escape built entirely from caller-chosen names; treat it
+  as defence in depth behind the container boundary, not as the boundary
+  itself.
+
+### Known residuals (open, not hidden)
+
+These are real gaps in the current implementation, tracked as tickets rather
+than silently accepted:
+
+- **BWAICODE-4 — named-volume binds are not validated.** A `Binds` entry
+  with no slash in the host portion (`Binds: ["somevol:/host"]`) is treated
+  as a Docker-managed named volume and skips validation entirely. If a
+  host-backed named volume already exists (created before the guard ever
+  saw a request, since `POST /volumes/create` is itself denied as an
+  unmodelled route), attaching it still reaches host data. A regression
+  gate deliberately locks in this permissive behaviour today and fails the
+  build the moment it is fixed, specifically so the fix can't land silently
+  — see `internal/guard/escape_test.go`,
+  `mount_spelling4_named_volume_bind_is_a_KNOWN_RESIDUAL`.
+- **Volume names are host-wide visible** via `/volumes`, `/system/df`
+  (`Volumes[].Name`, `Mountpoint`) and `/containers/json`
+  (`Mounts[].Name`) — all three needed for basic `docker ps`/`docker volume
+  ls` to work. Removing routes closes nothing, because `/containers/json`
+  alone already discloses the same names and can't be removed; only
+  ownership-filtered response bodies would close this, and the guard
+  forwards response bodies untouched today.
+- **`/events` discloses strictly more than `/containers/json`.** As a
+  stream it also leaks event timing and action detail, including
+  `exec_create: <cmd>` — other projects' exec command lines and arguments,
+  not just their existence.
+- **BWAICODE-2 — the image allowlist matches by name, not content.** A
+  build tagged exactly `postgres:16` (an allowlisted name) poisons the
+  local image cache under that name even though its content differs from
+  the real `postgres:16`. This is a name allowlist, not a content-integrity
+  guarantee; only the separate digest-matched infra path carries that
+  stronger property.
+- **BWAICODE-3 — socket denial doesn't cover ancestor directories.** The
+  check rejects the Docker/Podman socket path itself and its known
+  basenames, but not a bind of an ancestor directory such as `/var` that
+  would contain the socket anyway.
+- **Validate-time symlink resolution is TOCTOU-racy against daemon-time
+  mounting.** The guard resolves symlinks when it validates a request, but
+  the daemon resolves and mounts the path later; a path that is swapped out
+  from under the check between those two moments is not caught.
 
 ### Architecture
 

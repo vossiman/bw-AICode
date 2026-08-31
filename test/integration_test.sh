@@ -279,6 +279,38 @@ rm -rf "$SHAPE_TEST_HOME"
 rm -rf "$BIND_TEST_HOME"
 
 # ============================================================
+# Test 0d: docs must not claim behaviour the code does not have
+# ============================================================
+echo ""
+echo "--- documentation claims ---"
+
+doc="$PROJECT_DIR/docs/docker-security.md"
+doc_fail=0
+
+if grep -q 'Read operations.*always allowed' "$doc"; then
+  echo "  stale claim: GET/HEAD always allowed"
+  doc_fail=1
+fi
+if grep -q 'unconditionally blocked' "$doc"; then
+  echo "  stale claim: build unconditionally blocked"
+  doc_fail=1
+fi
+if ! grep -q 'infra_image_digests' "$doc"; then
+  echo "  missing: digest-pinned infra images not documented"
+  doc_fail=1
+fi
+if ! grep -q 'BW_EXTRA_VOLUME_PATHS' "$doc"; then
+  echo "  missing: operator volume path override not documented"
+  doc_fail=1
+fi
+
+if (( doc_fail )); then
+  fail "documentation claims" "docs/docker-security.md does not match implemented behaviour"
+else
+  ok "documentation claims match implementation"
+fi
+
+# ============================================================
 # bw-docker-guard integration tests
 # ============================================================
 echo ""
