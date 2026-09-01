@@ -1,5 +1,85 @@
 # Changelog
 
+## Unreleased
+
+### Security: CAF-001 guard rewrite
+
+An audit (CAF-001) found a three-step host escape built entirely from
+caller-chosen names: an image name claiming to be infrastructure, a
+compose-harvested bind path, and a `buildx_buildkit_`-prefixed container
+name. The guard now grants privilege only from facts the host resolves,
+never facts the caller supplies. Behaviour changes an operator will notice:
+
+- **Untagged `docker build` is now denied**, and every `-t` tag on a build
+  must be in the allowlist. Previously all builds were allowed
+  unconditionally.
+- **`docker load` / `POST /images/load` is now denied in every mode**
+  (including guarded mode). A loaded tar's own repo-tags can't be checked
+  without unpacking the stream, so it was an unconstrained way to mint an
+  image name. Use `--full-docker` if you need it.
+- Infrastructure images (buildkit, etc.) are now matched by content
+  **digest**, resolved host-side at session start, not by name — and a
+  digest match relaxes only `Privileged`, not the rest of `HostConfig`.
+- Bind mount paths outside the project directory are no longer harvested
+  from the project's own `docker-compose.yml`; they come only from the
+  operator's `BW_EXTRA_VOLUME_PATHS` environment variable.
+- Container ownership for pre-existing infrastructure containers is seeded
+  from a host-side `docker ps` snapshot, not recognised by a
+  `buildx_buildkit_` name prefix a caller could reproduce.
+- Mount `Type` is now default-deny (only a validated `bind` and a harmless
+  `tmpfs` pass); reads are now deny-by-default with ownership enforced on
+  per-container reads (`logs`, `stats`, `archive`, `changes`, `top`,
+  `export`), matching the write path.
+- **Container create now fails closed on unknown fields.** A create body may
+  only contain fields the guard has explicitly reasoned about; anything else
+  is denied. The old model enumerated the dangerous `HostConfig` fields and
+  denied those, so every field it had not heard of was permitted — which is
+  how the same host escape was found six times. Operator-visible effect:
+  **`--sysctl`, `--runtime`, `--storage-opt` and `--annotation` are now
+  denied in guarded mode** (compose `sysctls:` is the common one), along with
+  `--cidfile`, `--cgroup-parent`, `--volume-driver`, `--link` and the
+  address-taking log drivers; and a field added by a future Docker API
+  version is denied until someone reasons about it. If a project needs one,
+  add it to `hostConfigKnownKeys` with the reasoning in a reviewed change.
+- **`--security-opt systempaths=unconfined` is now denied.** The CLI turns
+  it into empty `MaskedPaths`/`ReadonlyPaths` arrays plus an empty
+  `SecurityOpt`, so the `SecurityOpt` check never saw it; an empty array
+  replaces the daemon's `/proc` defaults, making host-global
+  `/proc/sys/kernel/core_pattern` writable and unmasking `/proc/kcore`.
+- **`--device-cgroup-rule` and `--gpus` are now denied.** `--device` was
+  already denied, but `CAP_MKNOD` is in Docker's default capability set, so
+  the device cgroup was the only barrier left between a container and the
+  host's raw block devices.
+- **Privileged containers are now denied outright, for every image.** A
+  pinned infra digest no longer relaxes `Privileged`; it now buys only the
+  right to name the image without allowlisting it. The digest pins the
+  image's CONTENT while the COMMAND stays caller-supplied — through
+  `Entrypoint`, `Cmd`, and also `Healthcheck`, which the daemon executes and
+  whose output comes back through `docker inspect` — so the relaxation
+  amounted to a root shell in a privileged container behind a digest that
+  `GET /images/json` hands out for free. Nothing needed it: `bw-common.sh`
+  seeds buildkit builders that already exist host-side, so the guard only
+  has to operate a privileged builder, never create one.
+- **`exec` and `attach` on host-seeded containers are denied in every
+  mode.** Seeding exists so a session can manage buildkit's lifecycle; that
+  container runs privileged, so a shell inside it was a host escape needing
+  no create call at all. Lifecycle actions (start/stop/wait) and inspect
+  still work.
+- **Consequence, stated plainly: the buildx `docker-container` driver no
+  longer works through the guard for BUILDS.** It builds by exec'ing into
+  the builder container (a real build traces four `exec` calls). The
+  casualties are multi-platform builds (`--platform linux/amd64,linux/arm64`)
+  and cache export/import (`--cache-to` / `--cache-from`). Plain
+  `docker build` and `docker compose build` use the default `docker` driver
+  and `POST /build`, and are unaffected. Use `--full-docker`, or build
+  outside the sandbox, when you need the container driver.
+
+See `docs/docker-security.md` for the full accounting, including the
+residuals that remain open (named-volume binds, host-wide volume-name
+visibility, `/events` verbosity, name-based image allowlisting, socket
+denial not covering ancestor directories, and validate-time-vs-daemon-time
+TOCTOU on symlinks).
+
 ## v1.0.0
 
 First stable release of bw-AICode — bubblewrap sandbox wrappers with Docker API guard proxy.

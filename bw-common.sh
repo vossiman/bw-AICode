@@ -196,16 +196,12 @@ derive_docker_allowlist() {
         [[ -n "$net" ]] && networks+=("$net")
       done <<< "$compose_networks" || true
 
-      # Extract bind mount sources outside project dir (e.g. /var/run/docker.sock)
-      local compose_binds
-      compose_binds="$(echo "$resolved" | jq -r '
-        [.services // {} | to_entries[] | .value.volumes // [] | .[] |
-         select(type == "object" and .type == "bind") | .source] | unique[]
-      ' 2>/dev/null)"
-      while IFS= read -r bp; do
-        [[ -n "$bp" ]] || continue
-        case "$bp" in "$STARTDIR"|"$STARTDIR"/*) ;; *) extra_volume_paths+=("$bp") ;; esac
-      done <<< "$compose_binds" || true
+      # Bind mount sources are deliberately NOT harvested from the compose
+      # file. The project is untrusted input, so letting it nominate entries
+      # in allowed_volume_paths meant a repository could request "/" or a
+      # Docker socket and have the guard honour it (CAF-001). Operators who
+      # genuinely need an out-of-project mount set BW_EXTRA_VOLUME_PATHS
+      # host-side; see docs/docker-security.md.
     else
       echo "Warning: docker compose config failed for $compose_file; allowlist may be incomplete" >&2
       compose_project="$(basename "$STARTDIR")"
@@ -292,6 +288,15 @@ derive_docker_allowlist() {
   # Check global Claude desktop config
   _extract_mcp_docker_images "$HOME/.config/Claude/claude_desktop_config.json"
 
+  # --- Source 3: operator-supplied extra volume paths (host-side only) ---
+  # Colon-separated, set in the user's own shell, never read from the project.
+  if [[ -n "${BW_EXTRA_VOLUME_PATHS:-}" ]]; then
+    local IFS=:
+    for bp in $BW_EXTRA_VOLUME_PATHS; do
+      [[ -n "$bp" ]] && extra_volume_paths+=("$bp")
+    done
+  fi
+
   # --- Deduplicate ---
   local unique_images=() unique_networks=()
   local -A seen_img seen_net
@@ -331,6 +336,41 @@ derive_docker_allowlist() {
     volume_paths_json="[]"
   fi
 
+  # --- Host-resolved infrastructure facts ---
+  # Both are derived from the local Docker daemon, never from project input.
+  # A digest names content, so it cannot be minted; a container ID list is
+  # a snapshot of what already exists on this host.
+  local infra_digests_json="[]" preowned_json="[]"
+  if command -v docker &>/dev/null; then
+    local buildkit_digests
+    buildkit_digests="$(docker image inspect \
+      --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+      moby/buildkit 2>/dev/null | sed -n 's/.*@//p' | sort -u)"
+    if [[ -n "$buildkit_digests" ]]; then
+      infra_digests_json="$(printf '%s\n' "$buildkit_digests" | jq -R . | jq -s 'map(select(. != ""))')"
+    fi
+
+    # Resolve pre-owned containers by IMAGE, not by name: a name filter would
+    # promote any container a caller (or a prior/sibling session) happened to
+    # name "buildx_buildkit_*" to infra status. Image IDs are content
+    # addresses the caller cannot mint, the same digest-over-name principle
+    # as InfraImageDigests above. Seed both the container's full ID and its
+    # name so a request addressed either way resolves.
+    local buildkit_image_ids preowned=""
+    buildkit_image_ids="$(docker images -q moby/buildkit 2>/dev/null | sort -u)"
+    if [[ -n "$buildkit_image_ids" ]]; then
+      while IFS= read -r img_id; do
+        [[ -z "$img_id" ]] && continue
+        preowned+="$(docker ps -a --no-trunc --filter "ancestor=$img_id" --format '{{.ID}}' 2>/dev/null)"$'\n'
+        preowned+="$(docker ps -a --filter "ancestor=$img_id" --format '{{.Names}}' 2>/dev/null)"$'\n'
+      done <<<"$buildkit_image_ids"
+    fi
+    preowned="$(printf '%s' "$preowned" | sort -u)"
+    if [[ -n "$preowned" ]]; then
+      preowned_json="$(printf '%s\n' "$preowned" | jq -R . | jq -s 'map(select(. != ""))')"
+    fi
+  fi
+
   jq -n \
     --arg project_dir "$STARTDIR" \
     --arg compose_project "$compose_project" \
@@ -338,13 +378,17 @@ derive_docker_allowlist() {
     --argjson networks "$networks_json" \
     --arg volume_mount_root "$STARTDIR" \
     --argjson volume_paths "$volume_paths_json" \
+    --argjson infra_digests "$infra_digests_json" \
+    --argjson preowned "$preowned_json" \
     '{
       project_dir: $project_dir,
       compose_project: $compose_project,
       allowed_images: $images,
       allowed_networks: $networks,
       volume_mount_root: $volume_mount_root,
-      allowed_volume_paths: $volume_paths
+      allowed_volume_paths: $volume_paths,
+      infra_image_digests: $infra_digests,
+      preowned_containers: $preowned
     }' > "$BW_DOCKER_GUARD_CONFIG"
 }
 

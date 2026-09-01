@@ -240,32 +240,54 @@ func TestIsVolumePathAllowedSocketPaths(t *testing.T) {
 	}
 }
 
-// Test AllowedVolumePaths — explicitly allowed paths override socket checks
-func TestAllowedVolumePaths(t *testing.T) {
+// Was TestAllowedVolumePaths, which asserted that an entry in
+// AllowedVolumePaths overrides the socket denial. That is the second half
+// of CAF-001's socket path. Inverted here: sockets are denied unconditionally.
+func TestSocketPathsAreNeverAllowed(t *testing.T) {
 	cfg := &Config{
 		VolumeMountRoot:    "/project",
-		AllowedVolumePaths: []string{"/var/run/docker.sock"},
+		AllowedVolumePaths: []string{"/var/run/docker.sock", "/opt/shared"},
 	}
 
-	// docker.sock allowed because it's in AllowedVolumePaths
-	if !cfg.IsVolumePathAllowed("/var/run/docker.sock") {
-		t.Error("/var/run/docker.sock should be allowed when in AllowedVolumePaths")
-	}
+	t.Run("docker.sock denied even when explicitly listed", func(t *testing.T) {
+		if cfg.IsVolumePathAllowed("/var/run/docker.sock") {
+			t.Error("CAF-001: an explicit allowlist entry must not override socket denial")
+		}
+	})
 
-	// Other socket paths still denied
-	if cfg.IsVolumePathAllowed("/var/run/podman.sock") {
-		t.Error("/var/run/podman.sock should be denied (not in AllowedVolumePaths)")
-	}
+	t.Run("podman.sock denied", func(t *testing.T) {
+		if cfg.IsVolumePathAllowed("/var/run/podman.sock") {
+			t.Error("/var/run/podman.sock should be denied")
+		}
+	})
 
-	// Paths outside project and not in AllowedVolumePaths still denied
-	if cfg.IsVolumePathAllowed("/etc/passwd") {
-		t.Error("/etc/passwd should be denied")
-	}
+	t.Run("non-socket explicit path still allowed", func(t *testing.T) {
+		if !cfg.IsVolumePathAllowed("/opt/shared") {
+			t.Error("a non-socket explicit path should still be allowed")
+		}
+	})
 
-	// Paths under project still work
-	if !cfg.IsVolumePathAllowed("/project/data") {
-		t.Error("/project/data should be allowed (under VolumeMountRoot)")
-	}
+	t.Run("path outside project and not listed is denied", func(t *testing.T) {
+		if cfg.IsVolumePathAllowed("/etc/passwd") {
+			t.Error("/etc/passwd should be denied")
+		}
+	})
+
+	t.Run("path under project root still allowed", func(t *testing.T) {
+		if !cfg.IsVolumePathAllowed("/project/data") {
+			t.Error("/project/data should be allowed (under VolumeMountRoot)")
+		}
+	})
+
+	t.Run("mounting the socket's parent directory is denied even when listed", func(t *testing.T) {
+		cfg2 := &Config{
+			VolumeMountRoot:    "/project",
+			AllowedVolumePaths: []string{"/var/run"},
+		}
+		if cfg2.IsVolumePathAllowed("/var/run") {
+			t.Error("/var/run should be denied: mounting it exposes the socket inside")
+		}
+	})
 }
 
 // Test that VolumeMountRoot symlinks are resolved in Load()
@@ -290,4 +312,51 @@ func TestLoadResolvesVolumeMountRoot(t *testing.T) {
 	if cfg.VolumeMountRoot != realDir {
 		t.Errorf("VolumeMountRoot = %q, want %q (resolved symlink)", cfg.VolumeMountRoot, realDir)
 	}
+}
+
+func TestIsInfraImageRequiresExactDigest(t *testing.T) {
+	realDigest := "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	cfg := &Config{
+		ProjectDir:        "/project",
+		AllowedImages:     []string{"postgres:16"},
+		InfraImageDigests: []string{realDigest},
+	}
+
+	t.Run("exact digest matches", func(t *testing.T) {
+		if !cfg.IsInfraImage("moby/buildkit@" + realDigest) {
+			t.Error("an image carrying the pinned digest should be infra")
+		}
+	})
+
+	t.Run("registry prefix does not defeat the match", func(t *testing.T) {
+		if !cfg.IsInfraImage("docker.io/moby/buildkit@" + realDigest) {
+			t.Error("docker.io prefix should not change the digest match")
+		}
+	})
+
+	t.Run("self-minted tag with the infra NAME is not infra", func(t *testing.T) {
+		if cfg.IsInfraImage("moby/buildkit:pwn") {
+			t.Error("CAF-001: a caller-chosen tag on the infra name must not be infra")
+		}
+	})
+
+	t.Run("bare infra name is not infra", func(t *testing.T) {
+		if cfg.IsInfraImage("moby/buildkit") {
+			t.Error("a name without a digest must not be infra")
+		}
+	})
+
+	t.Run("wrong digest is not infra", func(t *testing.T) {
+		other := "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+		if cfg.IsInfraImage("moby/buildkit@" + other) {
+			t.Error("an unpinned digest must not be infra")
+		}
+	})
+
+	t.Run("empty digest list means nothing is infra", func(t *testing.T) {
+		empty := &Config{ProjectDir: "/project"}
+		if empty.IsInfraImage("moby/buildkit@" + realDigest) {
+			t.Error("with no pinned digests nothing may be infra")
+		}
+	})
 }

@@ -140,38 +140,228 @@ From these, the proxy extracts: allowed images, allowed networks, compose projec
 
 The proxy is **deny-by-default**. Only explicitly modeled operations are allowed:
 
-- **Read operations** (GET/HEAD): always allowed
-- **Container create**: image must be in allowlist, volume mounts must be under project directory (symlink-resolved), dangerous flags blocked (`--privileged`, `--pid=host`, `--network=host`, `--userns=host`, `--ipc=host`, `--cgroupns=host`, `--uts=host`, `--cap-add`, `--device`, `--volumes-from`, `--security-opt`)
-- **Container lifecycle** (start/stop/restart/kill/attach/wait/logs/resize/exec/rm): only on containers owned by this session (created through the proxy or belonging to the compose project)
-- **Image pull**: only allowlisted images
-- **Build**: unconditionally blocked (use `--full-docker` if builds are needed)
-- **Network create/delete**: only allowlisted networks
+- **Read operations** (GET/HEAD): modelled explicitly, not blanket-allowed.
+  A fixed set of host-wide endpoints that carry no per-container payload is
+  allowed (`/_ping`, `/version`, `/info`, `/events`, `/containers/json`,
+  `/images/json`, `/networks`, `/volumes`, `/system/df`, plus image, network
+  and volume inspect-by-name). Per-container reads (`/containers/{id}/` `json`,
+  `archive`, `logs`, `stats`, `changes`, `top`, `export`) require the **same
+  ownership check the write path uses**, and so does exec inspect. The
+  request path must be canonical and unescaped; anything the model does not
+  recognise is denied.
+  Accepted residual: those host-wide endpoints disclose the *names* of other
+  projects' containers, images, networks and volumes, though not their
+  contents. `/events` discloses **strictly more** than `/containers/json` —
+  being a stream, it also leaks event timing and action detail, including
+  `exec_create: <cmd>`, i.e. other projects' exec command lines and their
+  arguments. Volume names are visible three separate ways: `/volumes`,
+  `/system/df` (`Volumes[].Name` and `Mountpoint`) and `/containers/json`
+  (`Mounts[].Name`). Because `/containers/json` is what `docker ps` runs on
+  and cannot be removed, dropping either of the other two hides nothing —
+  the route list is not the control here. Closing any of this requires
+  **ownership-filtered response bodies**, which the guard does not do today:
+  it validates requests and forwards responses untouched.
+- **Container create**: image must be in the allowlist, or match an
+  infrastructure image by content **digest** (see "Two kinds of trust"
+  below). Mount `Type` is default-deny: only a validated `bind` (path must
+  resolve, symlinks included, under the project directory or an operator-set
+  extra path) and a harmless `tmpfs` are permitted — `volume`, `npipe`,
+  `cluster`, and a `volume`-typed mount carrying an inline bind
+  `DriverConfig` are all rejected. Dangerous flags are rejected
+  unconditionally, for every image including infra images:
+  `--pid=host`, `--network=host`, `--userns=host`, `--ipc=host`
+  (including `container:<id>` pivoting to a host-namespaced container),
+  `--cgroupns=host`, `--uts=host`, `--cap-add`, `--device`,
+  `--device-cgroup-rule`, `--gpus`, `--volumes-from`, `--security-opt`,
+  `--security-opt systempaths=unconfined` (which the CLI sends as empty
+  `MaskedPaths`/`ReadonlyPaths` arrays, not as a `SecurityOpt` entry).
+  **`Privileged` is rejected outright, for every image, with no exception.**
+  **Any `HostConfig` field the guard has not explicitly reasoned about is
+  denied**, rather than passed through; see "Unknown fields fail closed".
+- **Container lifecycle** (start/stop/restart/kill/attach/wait/resize/exec/rm):
+  only on containers owned by this session — ownership comes from containers
+  created through the proxy, plus a host-side `docker ps` snapshot seeded at
+  session start (`preowned_containers`), matched on full container ID or
+  name. There is no name-prefix shortcut. **`exec` and `attach` are denied
+  on seeded containers in every mode**: seeding exists so the session can
+  manage buildkit's lifecycle, and that container runs privileged, so a
+  shell inside it is a host escape.
+- **Image pull**: only allowlisted images, or an infra image matched by
+  digest.
+- **Build**: requires every `-t` tag to be in the allowlist; an untagged
+  build is denied outright, because an untagged result can't be checked.
+  `/images/load` is denied in every mode: a loaded tar carries its own
+  repo-tags, which can't be checked without unpacking the stream, so it is
+  an unconstrained image-minting primitive with no cheaper fix than denial.
+  Use `--full-docker` if you genuinely need either.
+- **Network create/delete**: only allowlisted networks.
 - **Everything else**: blocked (Swarm, secrets, plugins, volume create, etc.)
+
+### Two kinds of trust, and why
+
+The guard distinguishes facts the **caller** supplies from facts the **host**
+resolves. Only the latter grants privilege.
+
+- **Infrastructure images** (`infra_image_digests` in the guard config) are
+  matched by content digest, resolved host-side via `docker image inspect`
+  at session start, never by name or tag. A digest names content, so a
+  caller cannot mint one by choosing a string. Matching an infra digest now
+  buys exactly one thing: **the image may be named without being in the
+  allowlist.** It relaxes no `HostConfig` field at all.
+
+  It used to relax `Privileged`. That was removed, not repaired. A digest
+  pins what the image *is*, while the command it runs stays caller-chosen —
+  first through `Entrypoint` and `Cmd`, and when those were required to be
+  absent, through `Healthcheck`, which the daemon also executes and whose
+  output comes back through `docker inspect`. Commands have more spellings
+  than a guard can enumerate; the privilege has one. The digest is not a
+  secret either (`GET /images/json` returns `RepoDigests`, and it is a public
+  registry digest regardless), so the relaxation amounted to a root shell in
+  a privileged container for anyone who could read an image list.
+
+  Nothing needed it. `bw-common.sh` resolves buildkit builders that already
+  exist **host-side** and seeds them as pre-owned, so the guard only ever has
+  to *operate* a privileged builder, never create one.
+- **Pre-existing infrastructure containers** are seeded into the ownership
+  tracker from a host-side `docker ps` snapshot (`preowned_containers`) at
+  startup, matched by full container ID or name — not by a
+  `buildx_buildkit_`-style name prefix a caller could reproduce.
+- **Bind mount paths outside the project directory** come only from the
+  operator's own `BW_EXTRA_VOLUME_PATHS` environment variable
+  (colon-separated, set in the host shell that launches the sandbox, never
+  read from the project). They are no longer harvested from the project's
+  `docker-compose.yml`, because the project directory is the untrusted
+  input the guard exists to constrain. An explicit `-v` naming a Docker
+  socket path is refused even when the caller lists it, and even when it
+  falls inside an otherwise-allowed path.
+
+### Unknown fields fail closed
+
+Container create is validated against an explicit list of fields the guard
+has reasoned about (`createKnownKeys` and `hostConfigKnownKeys` in
+`internal/guard/validator.go`). A body carrying any other key is denied.
+
+This inverts what the guard used to do. It enumerated the *dangerous*
+`HostConfig` fields and denied those, which meant every field it had not
+heard of was silently permitted — and the same host escape was then found
+six separate times, each one only after the previous had been closed:
+`Binds`; `HostConfig.Mounts` read from the wrong struct level; a
+`Type: "volume"` inline driver bind; a named-volume bind; empty
+`MaskedPaths`/`ReadonlyPaths`; and `DeviceCgroupRules`.
+
+The trade is deliberate. When a future Docker version adds a `HostConfig`
+field, the guard denies creates that use it until someone adds it to the
+list *with the reason it is safe*. A denied create the day the API changes
+is a much cheaper failure than a permitted escape nobody notices. Each
+entry in those lists carries a one-line comment saying why it is there;
+fields deliberately left out (`Sysctls`, `Runtime`, `StorageOpt`,
+`Annotations`, …) are named in a comment too, so "not listed" reads as a
+decision rather than an oversight.
+
+`internal/guard/escape_test.go` pins this with verbatim container-create
+bodies captured from a real `docker create` and `docker compose create`
+(the CLI marshals all 62 `HostConfig` keys on every call, zero values
+included), so a list that is too narrow fails the test suite rather than
+the user's build.
+
+### What stops working, plainly
+
+Two of the changes above have costs an operator will hit. Neither is a bug.
+
+**The buildx `docker-container` driver does not work through the guard for
+BUILDS.** That driver builds by exec'ing into the builder container (a real
+build traces four `exec` calls), and `exec` on a host-seeded container is now
+denied in every mode. The builder can still be started, stopped and inspected;
+it just cannot be used to build. The casualty is the workflows that driver
+exists for: **multi-platform builds (`--platform linux/amd64,linux/arm64`) and
+cache export/import (`--cache-to` / `--cache-from`)**. Plain `docker build` and
+`docker compose build` use the default `docker` driver, which goes through
+`POST /build`, and are unaffected. Run a docker-container build outside the
+sandbox, or with `--full-docker`.
+
+**The fail-closed field policy denies flags that used to work.** Today that
+means `--sysctl`, `--runtime`, `--storage-opt` and `--annotation` (all
+`omitempty`, so they only appear in a body when actually used), plus
+`--cidfile`, `--cgroup-parent`, `--volume-driver`, `--link` and the
+address-taking log drivers. **Compose `sysctls:` is common**, so this is the
+one most likely to bite. If a project genuinely needs one, the fix is to add
+it to `hostConfigKnownKeys` with the reasoning, in a reviewed change — not to
+widen the policy.
 
 ### What the guard blocks
 
 | Escape vector | How it's blocked |
 |---|---|
-| Arbitrary volume mount (`-v /:/host`) | Only mounts under project directory allowed (symlink-resolved) |
-| Symlink traversal (`-v /project/link-to-root:/host`) | `filepath.EvalSymlinks` resolves before path check |
-| Privileged container | `Privileged` flag rejected in request body |
-| Host PID/network namespace | `PidMode: host`, `NetworkMode: host` rejected |
-| Host user/IPC/cgroup/UTS namespace | `UsernsMode`, `IpcMode`, `CgroupnsMode`, `UTSMode` host values rejected |
-| Arbitrary image | Only allowlisted images can be pulled or used |
-| Capability escalation | `CapAdd` rejected |
-| Device access | `Devices` rejected |
-| Volume inheritance | `VolumesFrom` rejected |
-| Security option override | `SecurityOpt` rejected |
-| Docker build | `/build` unconditionally blocked |
-| Exec into non-project container | Container ownership tracking |
-| Docker/Podman socket in container | Socket paths detected by basename and known absolute paths |
-| Oversized request body | 10 MB body size limit on all write requests |
+| Arbitrary volume mount (`-v /:/host`) | Only mounts resolving under the project directory (or `BW_EXTRA_VOLUME_PATHS`) are allowed |
+| Symlink traversal (`-v /project/link-to-root:/host`) | `filepath.EvalSymlinks` resolves before the path check |
+| `Type: volume` mount with an inline bind `DriverConfig` (`{"type":"none","device":"/","o":"bind"}`) | Mount `Type` is default-deny; only `bind` and `tmpfs` pass |
+| Privileged container | `Privileged` rejected for every image, no exception |
+| Command smuggled into a trusted image (`Entrypoint`, `Cmd`, `Healthcheck`) | Nothing the guard can create is privileged, so a command is only ever a command in a confined container |
+| `--security-opt systempaths=unconfined` (empty `MaskedPaths`/`ReadonlyPaths`) | Both fields denied when present as anything but `null` |
+| Raw host block devices via `--device-cgroup-rule` + `mknod` | `DeviceCgroupRules` and `DeviceRequests` denied |
+| Shell in the privileged buildkit builder (`docker exec buildx_buildkit_default sh`) | `exec` and `attach` denied on host-seeded containers in every mode |
+| A `HostConfig` field nobody has reasoned about | Unknown create fields are denied, not passed through |
+| Host PID/network/user/IPC (including `container:<id>` pivot)/cgroup/UTS namespace | Host values rejected for every image, infra included |
+| Arbitrary image | Only allowlisted images pulled or run, or infra images matched by digest |
+| Minting an infra-looking image via build or load | Build tags must be allowlisted (untagged build denied); `/images/load` denied outright |
+| Capability escalation, devices, volumes-from, security-opt | Rejected for every image, infra included |
+| Exec into a non-project container | Ownership tracking, seeded host-side, no name-prefix exemption |
+| Cross-container file read (`/containers/{id}/archive`, `/logs`, `/stats`, …) | Per-container reads require the same ownership check writes use |
+| Docker/Podman socket in container | Socket paths denied by basename and absolute path, ahead of any explicit allowlist entry |
+| Oversized request body | 10 MB limit on write requests |
 
 ### What it doesn't protect against
 
-- Supply-chain attacks (malicious upstream MCP images)
-- Network exfiltration from allowed containers (same risk as the AI tool itself having network access)
-- Bugs in the proxy implementation (mitigated by deny-by-default and comprehensive tests)
+- Supply-chain attacks (malicious upstream images that are legitimately allowlisted)
+- Network exfiltration from allowed containers (the same risk as the AI tool
+  having network access at all)
+- Anything reachable through an allowlisted container's own privileges
+- Bugs in the proxy implementation. This is a filtering proxy, not a kernel
+  boundary. It was rewritten in 2026-08 after an audit (CAF-001) found a
+  three-step host escape built entirely from caller-chosen names; treat it
+  as defence in depth behind the container boundary, not as the boundary
+  itself.
+
+### Known residuals (open, not hidden)
+
+These are real gaps in the current implementation, tracked as tickets rather
+than silently accepted:
+
+- **BWAICODE-4 — named-volume binds are not validated.** A `Binds` entry
+  with no slash in the host portion (`Binds: ["somevol:/host"]`) is treated
+  as a Docker-managed named volume and skips validation entirely. If a
+  host-backed named volume already exists (created before the guard ever
+  saw a request, since `POST /volumes/create` is itself denied as an
+  unmodelled route), attaching it still reaches host data. A regression
+  gate deliberately locks in this permissive behaviour today and fails the
+  build the moment it is fixed, specifically so the fix can't land silently
+  — see `internal/guard/escape_test.go`,
+  `mount_spelling4_named_volume_bind_is_a_KNOWN_RESIDUAL`.
+- **Volume names are host-wide visible** via `/volumes`, `/system/df`
+  (`Volumes[].Name`, `Mountpoint`) and `/containers/json`
+  (`Mounts[].Name`) — all three needed for basic `docker ps`/`docker volume
+  ls` to work. Removing routes closes nothing, because `/containers/json`
+  alone already discloses the same names and can't be removed; only
+  ownership-filtered response bodies would close this, and the guard
+  forwards response bodies untouched today.
+- **`/events` discloses strictly more than `/containers/json`.** As a
+  stream it also leaks event timing and action detail, including
+  `exec_create: <cmd>` — other projects' exec command lines and arguments,
+  not just their existence.
+- **BWAICODE-2 — the image allowlist matches by name, not content.** A
+  build tagged exactly `postgres:16` (an allowlisted name) poisons the
+  local image cache under that name even though its content differs from
+  the real `postgres:16`. This is a name allowlist, not a content-integrity
+  guarantee; only the separate digest-matched infra path carries that
+  stronger property.
+- **BWAICODE-3 — socket denial doesn't cover ancestor directories.** The
+  check rejects the Docker/Podman socket path itself and its known
+  basenames, but not a bind of an ancestor directory such as `/var` that
+  would contain the socket anyway.
+- **Validate-time symlink resolution is TOCTOU-racy against daemon-time
+  mounting.** The guard resolves symlinks when it validates a request, but
+  the daemon resolves and mounts the path later; a path that is swapped out
+  from under the check between those two moments is not caught.
 
 ### Architecture
 

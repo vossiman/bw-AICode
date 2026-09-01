@@ -141,6 +141,176 @@ fi
 rm -rf "$SYMLINK_TEST_HOME"
 
 # ============================================================
+# Test 0b: compose bind paths must NOT reach the guard config
+# ============================================================
+echo ""
+echo "--- compose bind harvesting (CAF-001) ---"
+
+BIND_TEST_HOME="$(mktemp -d /tmp/bw-bind-test-XXXXXX)"
+mkdir -p "$BIND_TEST_HOME/project"
+cat > "$BIND_TEST_HOME/project/docker-compose.yml" <<'YAML'
+services:
+  app:
+    image: postgres:16
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /:/host
+YAML
+
+(
+  set +e
+  cd "$BIND_TEST_HOME/project" || exit 1
+  # shellcheck disable=SC1090
+  source "$PROJECT_DIR/bw-common.sh"
+  derive_docker_allowlist 2>/dev/null
+
+  if [[ -z "${BW_DOCKER_GUARD_CONFIG:-}" || ! -f "$BW_DOCKER_GUARD_CONFIG" ]]; then
+    echo "SKIP no config generated (docker compose unavailable)"
+    exit 2
+  fi
+
+  paths="$(jq -r '.allowed_volume_paths[]?' "$BW_DOCKER_GUARD_CONFIG")"
+  if grep -q 'docker\.sock' <<< "$paths"; then
+    echo "FAIL docker.sock reached allowed_volume_paths"
+    exit 1
+  fi
+  if grep -qx '/' <<< "$paths"; then
+    echo "FAIL / reached allowed_volume_paths"
+    exit 1
+  fi
+  echo "OK compose binds did not reach the allowlist"
+  exit 0
+)
+bind_test_rc=$?
+case $bind_test_rc in
+  0) ok "compose binds excluded from allowed_volume_paths" ;;
+  2) skip "compose bind harvesting" "docker compose unavailable" ;;
+  *) fail "compose bind harvesting" "project-controlled bind path reached the guard config" ;;
+esac
+
+# ============================================================
+# Test 0c: preowned_containers must carry FULL (64-char) container IDs
+# (CAF-001 fix round 2, I3): a hand-built test fixture can't catch a
+# truncation bug in how derive_docker_allowlist actually produces its
+# output, so this exercises the real function end to end against a real
+# Docker daemon, using a throwaway image tagged "moby/buildkit" and a
+# container created from it.
+# ============================================================
+echo ""
+echo "--- preowned_containers ID shape (CAF-001 I3) ---"
+
+SHAPE_TEST_HOME="$(mktemp -d /tmp/bw-shape-test-XXXXXX)"
+mkdir -p "$SHAPE_TEST_HOME/project"
+
+(
+  set +e
+  if ! docker info &>/dev/null; then
+    echo "SKIP docker unavailable"
+    exit 2
+  fi
+
+  src_image_id="$(docker images -q | head -1)"
+  if [[ -z "$src_image_id" ]]; then
+    echo "SKIP no local docker image available to tag as moby/buildkit"
+    exit 2
+  fi
+
+  shape_tag="moby/buildkit:bwtest-shape-$$"
+  if ! docker tag "$src_image_id" "$shape_tag" 2>/dev/null; then
+    echo "SKIP could not tag a throwaway moby/buildkit image"
+    exit 2
+  fi
+
+  shape_cid="$(docker create --entrypoint /bin/true "$shape_tag" 2>/dev/null)"
+  cleanup_shape() {
+    [[ -n "${shape_cid:-}" ]] && docker rm -f "$shape_cid" &>/dev/null
+    docker rmi "$shape_tag" &>/dev/null
+  }
+  if [[ -z "$shape_cid" ]]; then
+    cleanup_shape
+    echo "SKIP could not create a throwaway container from the tagged image"
+    exit 2
+  fi
+
+  cd "$SHAPE_TEST_HOME/project" || { cleanup_shape; exit 1; }
+  # shellcheck disable=SC1090
+  source "$PROJECT_DIR/bw-common.sh"
+  derive_docker_allowlist 2>/dev/null
+
+  if [[ -z "${BW_DOCKER_GUARD_CONFIG:-}" || ! -f "$BW_DOCKER_GUARD_CONFIG" ]]; then
+    cleanup_shape
+    echo "SKIP no config generated"
+    exit 2
+  fi
+
+  ids="$(jq -r '.preowned_containers[]?' "$BW_DOCKER_GUARD_CONFIG")"
+  cleanup_shape
+
+  if ! grep -qx "$shape_cid" <<< "$ids"; then
+    echo "FAIL the throwaway container's full ID was not seeded (got: $ids)"
+    exit 1
+  fi
+
+  # Every id-looking (pure lowercase hex, 12+ chars) entry must be exactly
+  # 64 characters — Docker's full ID length — never the 12-char truncated
+  # form `docker ps` emits by default.
+  bad=0
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if [[ "$entry" =~ ^[0-9a-f]{12,}$ ]] && (( ${#entry} != 64 )); then
+      echo "FAIL truncated id-looking entry in preowned_containers: $entry (${#entry} chars)"
+      bad=1
+    fi
+  done <<< "$ids"
+  (( bad != 0 )) && exit 1
+
+  echo "OK preowned_containers carries full 64-char IDs"
+  exit 0
+)
+shape_test_rc=$?
+case $shape_test_rc in
+  0) ok "preowned_containers seeds full (untruncated) container IDs" ;;
+  2) skip "preowned_containers ID shape" "docker unavailable or setup failed" ;;
+  *) fail "preowned_containers ID shape" "a truncated or otherwise malformed id reached preowned_containers" ;;
+esac
+
+rm -rf "$SHAPE_TEST_HOME"
+
+rm -rf "$BIND_TEST_HOME"
+
+# ============================================================
+# Test 0d: docs must not claim behaviour the code does not have
+# ============================================================
+echo ""
+echo "--- documentation claims ---"
+
+doc="$PROJECT_DIR/docs/docker-security.md"
+doc_fail=0
+
+if grep -q 'Read operations.*always allowed' "$doc"; then
+  echo "  stale claim: GET/HEAD always allowed"
+  doc_fail=1
+fi
+if grep -q 'unconditionally blocked' "$doc"; then
+  echo "  stale claim: build unconditionally blocked"
+  doc_fail=1
+fi
+if ! grep -q 'infra_image_digests' "$doc"; then
+  echo "  missing: digest-pinned infra images not documented"
+  doc_fail=1
+fi
+if ! grep -q 'BW_EXTRA_VOLUME_PATHS' "$doc"; then
+  echo "  missing: operator volume path override not documented"
+  doc_fail=1
+fi
+
+if (( doc_fail )); then
+  fail "documentation claims" "docs/docker-security.md does not match implemented behaviour"
+else
+  ok "documentation claims match implementation"
+fi
+
+# ============================================================
 # bw-docker-guard integration tests
 # ============================================================
 echo ""
@@ -343,6 +513,44 @@ else
   else
     ok "guarded: --privileged blocked (error: ${output:0:80})"
   fi
+fi
+
+# Run with --security-opt systempaths=unconfined — should be blocked.
+#
+# The CLI translates this CLIENT-SIDE into HostConfig.MaskedPaths: [] and
+# ReadonlyPaths: [], and sends an EMPTY SecurityOpt array, so the guard's
+# SecurityOpt check never sees it. An empty array replaces the daemon's
+# defaults: /proc/sys loses its read-only bind, and core_pattern is
+# host-global.
+#
+# The probe does NOT use `test -w`: root's DAC check passes on core_pattern
+# even under the read-only bind, so `test -w` reports writable in a perfectly
+# confined container (verified on docker 29.7.2) and would only be testing
+# whether the container ran at all. Two things actually discriminate, and both
+# are checked: the read-only bind is visible in /proc/mounts (it disappears
+# entirely under the attack), and a write really succeeds. The write is a
+# write-BACK of the value already there, so it changes nothing on the host.
+output="$(docker_via_guard run --rm --security-opt systempaths=unconfined alpine sh -c '
+  grep -q " /proc/sys proc ro," /proc/mounts || echo ESCAPED_NO_RO_BIND
+  cat /proc/sys/kernel/core_pattern > /tmp/v 2>/dev/null &&
+    (cat /tmp/v > /proc/sys/kernel/core_pattern) 2>/dev/null && echo ESCAPED_WRITABLE' 2>&1 || true)"
+if echo "$output" | grep -q "ESCAPED"; then
+  fail "guarded: --security-opt systempaths=unconfined" "/proc/sys lost its read-only bind (host escape): $output"
+else
+  ok "guarded: --security-opt systempaths=unconfined blocked"
+fi
+
+# Run with --device-cgroup-rule — should be blocked.
+#
+# Devices is denied, but the device cgroup is the only barrier left: CAP_MKNOD
+# is in Docker's DEFAULT capability set, so a rule plus mknod reaches the
+# host's raw block devices. The probe reads one byte of major 8 minor 0.
+output="$(docker_via_guard run --rm --device-cgroup-rule='b 8:* rwm' alpine \
+  sh -c 'mknod /tmp/hostdisk b 8 0 && head -c1 /tmp/hostdisk >/dev/null && echo ESCAPED' 2>&1 || true)"
+if echo "$output" | grep -q "ESCAPED"; then
+  fail "guarded: --device-cgroup-rule" "raw host block device readable (host escape)"
+else
+  ok "guarded: --device-cgroup-rule blocked"
 fi
 
 # Run disallowed image — should be blocked

@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strings"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/vossi/bw-docker-guard/internal/config"
@@ -45,6 +45,7 @@ func main() {
 	}
 
 	tracker := ownership.New()
+	tracker.Seed(cfg.PreownedContainers)
 
 	// Pre-populate tracker with existing compose project containers and networks.
 	if cfg.ComposeProject != "" {
