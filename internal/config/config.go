@@ -108,9 +108,21 @@ func (c *Config) IsReadOnly() bool {
 
 // normalizeImage strips the default Docker Hub registry prefix so that
 // "docker.io/mcp/postgres" matches allowlist entry "mcp/postgres" and vice versa.
+//
+// The "library/" strip is conditional on what follows being a SINGLE
+// component. "library" is Docker Hub's official-images namespace and a Hub
+// repository path is exactly namespace/name, so "library/alpine" and "alpine"
+// are the same repository (verified against docker 29.7.2: tagging
+// "library/bwtest:v1" produces the image "bwtest:v1"). A longer path is not
+// that: "library/acme/widget" and "acme/widget" are two DISTINCT repositories
+// on the same daemon, verified the same way. Stripping unconditionally made
+// them compare equal, which turned the exact build-tag match into a way to
+// mint a tag that is not in BuildableImages.
 func normalizeImage(image string) string {
 	image = strings.TrimPrefix(image, "docker.io/")
-	image = strings.TrimPrefix(image, "library/")
+	if rest, ok := strings.CutPrefix(image, "library/"); ok && !strings.Contains(rest, "/") {
+		image = rest
+	}
 	return image
 }
 

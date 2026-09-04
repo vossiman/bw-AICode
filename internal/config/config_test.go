@@ -464,3 +464,31 @@ func TestIsBuildTagAllowedEmptyListBuildsNothing(t *testing.T) {
 		t.Error("a project with no buildable services must not be able to build anything")
 	}
 }
+
+// The "library/" prefix is Docker Hub's official-images namespace, and a Hub
+// repository path is exactly namespace/name. Stripping it unconditionally made
+// "library/acme/widget" compare equal to "acme/widget", which are two distinct
+// repositories on a real daemon (verified against docker 29.7.2), and that
+// equivalence let a build mint a tag absent from BuildableImages.
+func TestLibraryPrefixOnlyCollapsesSingleComponentNames(t *testing.T) {
+	cfg := &Config{BuildableImages: []string{"library/acme/widget"}}
+	if cfg.IsBuildTagAllowed("acme/widget") {
+		t.Error("acme/widget matched buildable library/acme/widget; they are distinct repositories")
+	}
+	if !cfg.IsBuildTagAllowed("library/acme/widget") {
+		t.Error("a buildable image no longer matches itself")
+	}
+
+	// The two-component case is a genuine alias and must keep matching, in
+	// both directions.
+	official := &Config{
+		AllowedImages:   []string{"library/alpine:3"},
+		BuildableImages: []string{"library/myapp"},
+	}
+	if !official.IsImageAllowed("alpine:3") {
+		t.Error("alpine:3 no longer matches allowlisted library/alpine:3")
+	}
+	if !official.IsBuildTagAllowed("myapp") {
+		t.Error("myapp no longer matches buildable library/myapp")
+	}
+}
