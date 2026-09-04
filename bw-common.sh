@@ -154,7 +154,7 @@ resolve_symlink_binds() {
 # server configs. Produces a JSON allowlist for bw-docker-guard.
 # Sets: BW_DOCKER_MODE ("guarded"|"readonly"), BW_DOCKER_GUARD_CONFIG (path)
 derive_docker_allowlist() {
-  local images=() networks=() extra_volume_paths=() compose_project=""
+  local images=() networks=() buildable_images=() extra_volume_paths=() compose_project=""
 
   # --- Source 1: Docker Compose files ---
   local compose_file=""
@@ -188,6 +188,27 @@ derive_docker_allowlist() {
       while IFS= read -r img; do
         [[ -n "$img" ]] && images+=("$img")
       done <<< "$compose_images" || true
+
+      # Extract the tags a BUILD is allowed to produce: only services that
+      # actually declare build:. This is a strict subset of allowed_images,
+      # and it is what POST /build is checked against.
+      #
+      # Why a separate list (BWAICODE-2): allowed_images matches by NAME, so
+      # a build tagged exactly "postgres:16" passed the image check, and
+      # Docker resolves that name from the local cache ahead of a registry
+      # pull, so the build shadows the real image for every later create.
+      # Only
+      # services with a build: section have any business minting a tag, so
+      # nothing else may.
+      local compose_buildable
+      compose_buildable="$(echo "$resolved" | jq -r --arg proj "$compose_project" '
+        .services // {} | to_entries[] |
+        select(.value.build) |
+        .value.image // "\($proj)-\(.key)"
+      ' 2>/dev/null)"
+      while IFS= read -r img; do
+        [[ -n "$img" ]] && buildable_images+=("$img")
+      done <<< "$compose_buildable" || true
 
       # Extract resolved network names (uses .name field which includes project prefix)
       local compose_networks
@@ -330,6 +351,12 @@ derive_docker_allowlist() {
   else
     networks_json="[]"
   fi
+  local buildable_json
+  if (( ${#buildable_images[@]} > 0 )); then
+    buildable_json="$(printf '%s\n' "${buildable_images[@]}" | jq -R . | jq -s 'unique')"
+  else
+    buildable_json="[]"
+  fi
   if (( ${#extra_volume_paths[@]} > 0 )); then
     volume_paths_json="$(printf '%s\n' "${extra_volume_paths[@]}" | jq -R . | jq -s .)"
   else
@@ -376,6 +403,7 @@ derive_docker_allowlist() {
     --arg compose_project "$compose_project" \
     --argjson images "$images_json" \
     --argjson networks "$networks_json" \
+    --argjson buildable "$buildable_json" \
     --arg volume_mount_root "$STARTDIR" \
     --argjson volume_paths "$volume_paths_json" \
     --argjson infra_digests "$infra_digests_json" \
@@ -385,6 +413,7 @@ derive_docker_allowlist() {
       compose_project: $compose_project,
       allowed_images: $images,
       allowed_networks: $networks,
+      buildable_images: $buildable,
       volume_mount_root: $volume_mount_root,
       allowed_volume_paths: $volume_paths,
       infra_image_digests: $infra_digests,
@@ -698,7 +727,7 @@ parse_bw_flags() {
 _print_guard_summary() {
   local cfg="$BW_DOCKER_GUARD_CONFIG"
   local mode="$BW_DOCKER_MODE"
-  local images networks
+  local images networks buildable
 
   if [[ "$mode" == "readonly" ]]; then
     echo "[bw] Docker: read-only (no images allowed)" >&2
@@ -708,6 +737,7 @@ _print_guard_summary() {
 
   images="$(jq -r '.allowed_images[]' "$cfg" 2>/dev/null)"
   networks="$(jq -r '.allowed_networks[]' "$cfg" 2>/dev/null)"
+  buildable="$(jq -r '.buildable_images[]' "$cfg" 2>/dev/null)"
 
   echo "[bw] Docker: guarded" >&2
   echo "[bw]   log: $BW_GUARD_LOG" >&2
@@ -716,6 +746,12 @@ _print_guard_summary() {
     while IFS= read -r img; do
       echo "[bw]     + $img" >&2
     done <<< "$images"
+  fi
+  if [[ -n "$buildable" ]]; then
+    echo "[bw]   buildable (docker build -t):" >&2
+    while IFS= read -r img; do
+      echo "[bw]     + $img" >&2
+    done <<< "$buildable"
   fi
   if [[ -n "$networks" ]]; then
     echo "[bw]   networks:" >&2

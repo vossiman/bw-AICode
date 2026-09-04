@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -51,6 +52,7 @@ func escapeConfig() *config.Config {
 	return &config.Config{
 		ProjectDir:         "/project",
 		AllowedImages:      []string{"postgres:16", "myproj-app"},
+		BuildableImages:    []string{"myproj-app"},
 		AllowedNetworks:    []string{"mynet"},
 		VolumeMountRoot:    "/project",
 		InfraImageDigests:  []string{escapeDigest},
@@ -62,7 +64,9 @@ func escapeValidator() (*config.Config, *ownership.Tracker, *Validator) {
 	cfg := escapeConfig()
 	tracker := ownership.New()
 	tracker.Seed(cfg.PreownedContainers)
-	return cfg, tracker, NewValidator(cfg, tracker)
+	v := NewValidator(cfg, tracker)
+	v.SetVolumeLookup(fakeVolumeLookup(testVolumes))
+	return cfg, tracker, v
 }
 
 // createBody wraps a HostConfig fragment in a container-create body using an
@@ -538,36 +542,68 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 		}
 	})
 
-	t.Run("mount_spelling4_named_volume_bind_is_a_KNOWN_RESIDUAL", func(t *testing.T) {
-		// RESIDUAL, NOT CLOSED. Tracked as BWAICODE-4.
+	t.Run("mount_spelling4_named_volume_bind_is_closed", func(t *testing.T) {
+		// BWAICODE-4, closed. A Binds entry whose source has no slash is a
+		// volume NAME, and the name alone cannot say what backs it: a volume
+		// created with {"type":"none","device":"/","o":"bind"} is a host-root
+		// mount wearing an innocent name. The guard now asks the daemon.
 		//
-		// A Binds entry with no slash in the host portion is treated as a
-		// Docker-managed named volume and is not validated at all. That means
-		// `docker run -v somevol:/host` still attaches another project's
-		// named volume. It is only NOT a host-root escape because creating
-		// such a volume with a bind DriverConfig goes through POST /volumes/
-		// create, which the write model denies (unmodelled route).
-		//
-		// There is NO mitigation on the enumeration half, and this gate no
-		// longer claims one. /volumes was briefly removed from
-		// globalReadPaths on that theory, but /system/df returns
-		// Volumes[].Name and /containers/json returns Mounts[].Name for the
-		// whole host, and /containers/json is what `docker ps` runs on, so it
-		// cannot be removed. Route removal hides nothing here; only
-		// ownership-filtered response bodies would.
-		//
-		// This subtest asserts the CURRENT behaviour honestly. If it starts
-		// failing, BWAICODE-4 was fixed: delete this subtest and move the
-		// case up to the closed spellings above.
-		body := createBody(`{"Binds": ["somevol:/host"]}`)
-		d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body))
-		if !d.Allow {
-			t.Errorf("BWAICODE-4 appears to be FIXED (named-volume bind now denied: %s) — "+
-				"update this gate to assert the closure instead of the residual", d.Reason)
+		// This subtest used to assert the RESIDUAL, i.e. that such a bind was
+		// allowed. Do not restore that shape: the point of the gate is that
+		// each spelling stays dead.
+		hostile := []struct{ name, volume, why string }{
+			{"local-driver bind to host root", "hostroot_vol", "device=/ reaches the whole host filesystem"},
+			{"remote mount", "nfs_vol", "device is not an absolute host path the guard can check"},
+			{"third-party volume plugin", "plugin_vol", "backing is unknown to this guard"},
 		}
-		// The enumeration half of this residual is a READ concern, so it is
-		// asserted in read_volume_names_are_host_wide_visible below rather
-		// than here.
+		for _, h := range hostile {
+			body := createBody(`{"Binds": ["` + h.volume + `:/host"]}`)
+			if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); d.Allow {
+				t.Errorf("host-mount spelling 4 open: named volume %q allowed (%s)", h.volume, h.why)
+			}
+		}
+
+		// The same shape through HostConfig.Mounts is denied by the mount
+		// Type default-deny, asserted in mount_unknown_or_empty_type_is_denied.
+	})
+
+	t.Run("named_volume_positive_controls", func(t *testing.T) {
+		// A deny rule that denies everything is not a fix. These are the
+		// named-volume binds ordinary compose work depends on.
+		ok := []struct{ name, volume string }{
+			{"a volume that does not exist yet (the daemon will create a plain local one)", "brand_new_vol"},
+			{"an ordinary Docker-managed volume", "proj_data"},
+			{"a local-driver bind volume pointing inside the project", "inproject_vol"},
+		}
+		for _, c := range ok {
+			body := createBody(`{"Binds": ["` + c.volume + `:/data"]}`)
+			if d := v.Validate(makeRequest("POST", "/v1.45/containers/create", body)); !d.Allow {
+				t.Errorf("regression: %s denied: %s", c.name, d.Reason)
+			}
+		}
+	})
+
+	t.Run("named_volume_without_a_lookup_fails_closed", func(t *testing.T) {
+		// A validator with no daemon lookup cannot tell the two apart, so it
+		// must deny rather than fall back to the old skip.
+		cfg := escapeConfig()
+		nv := NewValidator(cfg, ownership.New())
+		body := createBody(`{"Binds": ["proj_data:/data"]}`)
+		if d := nv.Validate(makeRequest("POST", "/v1.45/containers/create", body)); d.Allow {
+			t.Error("a validator with no volume lookup allowed a named volume; it cannot know what backs it")
+		}
+	})
+
+	t.Run("named_volume_lookup_error_fails_closed", func(t *testing.T) {
+		cfg := escapeConfig()
+		ev := NewValidator(cfg, ownership.New())
+		ev.SetVolumeLookup(func(string) (*VolumeInfo, error) {
+			return nil, errors.New("daemon unreachable")
+		})
+		body := createBody(`{"Binds": ["proj_data:/data"]}`)
+		if d := ev.Validate(makeRequest("POST", "/v1.45/containers/create", body)); d.Allow {
+			t.Error("a failed volume lookup allowed the bind; an unanswerable question must deny")
+		}
 	})
 
 	t.Run("mount_unknown_or_empty_type_is_denied", func(t *testing.T) {
@@ -933,7 +969,7 @@ func TestCAF001EscapeChainIsDead(t *testing.T) {
 		}{
 			{"create an allowlisted container with an in-project bind", "POST", "/v1.45/containers/create",
 				createBody(`{"Binds": ["/project/data:/data"]}`)},
-			{"create with a named volume (BWAICODE-4 residual, see above)", "POST", "/v1.45/containers/create",
+			{"create with a named volume that does not exist yet", "POST", "/v1.45/containers/create",
 				createBody(`{"Binds": ["myproj_data:/data"]}`)},
 			{"build an allowlisted compose image", "POST", "/v1.45/build?t=myproj-app", ""},
 			{"pull an allowlisted image", "POST", "/v1.45/images/create?fromImage=postgres:16", ""},

@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Security: the four residuals left open by the CAF-001 rewrite
+
+The rewrite below closed the escape chain and left four findings filed rather
+than fixed (BWAICODE-2 through -5). All four are now closed. Behaviour changes
+an operator will notice:
+
+- **`docker build -t <tag>` now requires `<tag>` to be a compose service with
+  a `build:` section**, not merely an allowlisted image. The two lists are now
+  separate (`buildable_images` in the guard config, derived host-side). The
+  general image allowlist matches by NAME so an untagged pull resolves, which
+  meant a build tagged exactly `postgres:16` was allowed and then shadowed the
+  registry image in the local cache for every later create (BWAICODE-2).
+- **The build query string is deny-by-default**, like the container-create
+  body. `?remote=URL` is denied outright, `?networkmode=` is held to the same
+  rule as container create (`docker build --network host` was allowed even
+  though `docker run --network host` was not), and a parameter the guard has
+  not reasoned about is denied (BWAICODE-5). The parameters a real
+  `docker build` sends are covered, verified against docker 29.7.2.
+- **The exec create body is deny-by-default too.** It used to be read only for
+  `Privileged`, with every other field forwarded unread (BWAICODE-5).
+- **A `Binds` entry naming a volume is now resolved against the daemon.** A
+  volume that does not exist is fine; one carrying a `device` driver option is
+  checked against the same path rules a host bind gets; one on a third-party
+  driver is denied. A volume created with `device=/,o=bind` was a host-root
+  mount that the name alone could not reveal (BWAICODE-4).
+- **A `volume_mount_root` or `BW_EXTRA_VOLUME_PATHS` entry that contains a
+  Docker socket is now refused at config load**, with an error naming the
+  socket. `/var` and `/` used to be denied only because they lost the
+  allowlist comparison later, so the guarantee depended on the allowlist being
+  sane rather than on the socket rule (BWAICODE-3).
+
 ### Security: CAF-001 guard rewrite
 
 An audit (CAF-001) found a three-step host escape built entirely from

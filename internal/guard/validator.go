@@ -24,15 +24,41 @@ type Decision struct {
 	Reason string
 }
 
+// VolumeInfo is the subset of a Docker volume inspect response the guard
+// reasons about.
+type VolumeInfo struct {
+	Driver     string            `json:"Driver"`
+	Mountpoint string            `json:"Mountpoint"`
+	Options    map[string]string `json:"Options"`
+}
+
+// VolumeLookup resolves a named volume on the daemon. A nil VolumeInfo with a
+// nil error means the volume does not exist yet.
+type VolumeLookup func(name string) (*VolumeInfo, error)
+
 // Validator inspects Docker API requests and returns allow/deny decisions.
 type Validator struct {
 	config  *config.Config
 	tracker *ownership.Tracker
+	// lookupVolume resolves a named volume so a Binds entry naming one can be
+	// checked against the same path rules a host bind gets. A nil lookup
+	// denies every named volume: without the daemon's answer the guard cannot
+	// tell a Docker-managed volume from one created with
+	// device=/,o=bind, and guessing is what BWAICODE-4 was.
+	lookupVolume VolumeLookup
 }
 
-// NewValidator creates a new Validator with the given config and ownership tracker.
+// NewValidator creates a new Validator with the given config and ownership
+// tracker. The returned validator has NO volume lookup, so named-volume binds
+// are denied; call SetVolumeLookup to enable them.
 func NewValidator(cfg *config.Config, tracker *ownership.Tracker) *Validator {
 	return &Validator{config: cfg, tracker: tracker}
+}
+
+// SetVolumeLookup installs the daemon lookup used to validate named-volume
+// binds.
+func (v *Validator) SetVolumeLookup(fn VolumeLookup) {
+	v.lookupVolume = fn
 }
 
 // deviceMapping mirrors Docker's DeviceMapping struct for JSON parsing.
@@ -286,6 +312,62 @@ var hostConfigKnownKeys = map[string]bool{
 	// to be, add it here WITH the reasoning, not silently.
 }
 
+// buildKnownParams is the set of POST /build query parameters this guard has
+// reasoned about. Anything else is denied, the same inversion
+// hostConfigKnownKeys applies to the create body.
+//
+// The entries below are permitted as sent unless validateBuild checks them by
+// value. Every one of them configures the BUILD, not the daemon's
+// relationship to the host.
+var buildKnownParams = map[string]bool{
+	// --- checked by value in validateBuild ---
+	"t":           true, // the resulting tag, checked against BuildableImages
+	"networkmode": true, // host/container: forms denied, as at container create
+	"remote":      true, // denied outright: a daemon-side fetch from a caller URL
+
+	// --- permitted as sent ---
+	"dockerfile": true, // path to the Dockerfile INSIDE the build context
+	"q":          true, // suppress verbose output
+	"nocache":    true, // ignore the build cache
+	"cachefrom":  true, // images to reuse layers from; they still have to exist
+	"pull":       true, // always attempt to pull a newer base image
+	"rm":         true, // remove intermediate containers
+	"forcerm":    true, // always remove intermediate containers
+	"buildargs":  true, // ARG values, consumed inside the build
+	"labels":     true, // metadata on the resulting image
+	"target":     true, // which Dockerfile stage to stop at
+	"platform":   true, // os/arch of the result
+	"version":    true, // builder version selector (1 = classic, 2 = BuildKit)
+	"shmsize":    true, // /dev/shm size for build containers
+	"memory":     true, // build container resource limits, cgroup accounting only
+	"memswap":    true,
+	"cpushares":  true,
+	"cpusetcpus": true,
+	"cpuperiod":  true,
+	"cpuquota":   true,
+	"extrahosts": true, // /etc/hosts entries inside the build container
+	"buildid":    true, // caller-chosen build identifier, used to cancel a build
+	"outputs":    true, // BuildKit exporter; the client, not the daemon, writes the result
+	"session":    true, // BuildKit session id; POST /session is unrouted, so denied anyway
+	"squash":     true, // merges layers in the result; experimental daemon feature
+
+	// Verified against docker 29.7.2 through a logging unix-socket proxy:
+	// `docker build` sends dockerfile, t and version; `--network host` adds
+	// networkmode=host (which is now denied, as at container create); and
+	// --build-arg/--label/--no-cache/--pull add buildargs, labels, nocache
+	// and pull. All are covered above, so ordinary builds still pass.
+	//
+	// A BuildKit build (the CLI default) does not go through this route at
+	// all: it drives POST /session and POST /grpc, neither of which is
+	// routed, so the write model denies them. That predates this list;
+	// classic builds (DOCKER_BUILDKIT=0, version=1) are what works here.
+
+	// Deliberately ABSENT, and therefore denied: "remote" is listed above
+	// because it is checked by value rather than merely unlisted, so the
+	// denial names the parameter. Anything a future API version adds is
+	// denied until someone reasons about it here.
+}
+
 // logDriverAllowed are the logging drivers HostConfig.LogConfig may select.
 // The remaining drivers (syslog, fluentd, gelf, splunk, awslogs, ...) take an
 // address option, which makes the DAEMON connect somewhere of the caller's
@@ -303,6 +385,36 @@ var logDriverAllowed = map[string]bool{
 type execCreateRequest struct {
 	Privileged bool `json:"Privileged"`
 }
+
+// execKnownKeys is the set of exec-create body keys this guard has reasoned
+// about, same fail-closed inversion as createKnownKeys. The exec body was
+// parsed permissively: only Privileged was looked at, everything else passed
+// unread. That is the shape that let the container-create body be re-broken
+// five times.
+//
+// Every field here configures the process inside an ALREADY-CREATED container,
+// whose own privileges were settled at create time. There is no HostConfig on
+// an exec, so none of these can widen what the container may reach.
+var execKnownKeys = map[string]bool{
+	"Privileged":   true, // checked: denied
+	"AttachStdin":  true, // stream plumbing
+	"AttachStdout": true,
+	"AttachStderr": true,
+	"DetachKeys":   true, // client-side key sequence
+	"Tty":          true,
+	"ConsoleSize":  true,
+	"Cmd":          true, // the command, run with the container's own privileges
+	"Env":          true, // environment of that process
+	"User":         true, // uid/gid inside the container
+	"WorkingDir":   true, // path inside the container
+}
+
+// Verified against docker 29.7.2 through a logging unix-socket proxy: a real
+// `docker exec`, with and without -it, sends exactly
+// {"User","Privileged","Tty","AttachStdin","AttachStderr","AttachStdout",
+//  "DetachKeys","Env","WorkingDir","Cmd"} and nothing else. ConsoleSize is
+// listed above anyway because the Engine API defines it on this body and it
+// is only a terminal size; a client that does send it should not be denied.
 
 // networkCreateRequest is the subset of fields we inspect from network create.
 type networkCreateRequest struct {
@@ -440,10 +552,17 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	// Check bind mounts (HostConfig.Binds)
 	for _, bind := range req.HostConfig.Binds {
 		hostPath := strings.SplitN(bind, ":", 2)[0]
-		// Named volumes (e.g. "myapp_data:/data") are Docker-managed, not host
-		// filesystem paths. They don't contain "/" and don't start with "." or "~".
+		// A source with no slash and no ./~ prefix is a named volume, not a
+		// host path. It used to be skipped outright, which was the fourth
+		// spelling of the host-mount escape (BWAICODE-4): a volume created
+		// with {"type":"none","device":"/","o":"bind"} is a host-root mount
+		// that the NAME alone cannot distinguish from a Docker-managed one.
+		// So ask the daemon what the name refers to.
 		if !strings.HasPrefix(hostPath, "/") && !strings.HasPrefix(hostPath, ".") &&
 			!strings.HasPrefix(hostPath, "~") && !strings.Contains(hostPath, "/") {
+			if d := v.validateNamedVolume(hostPath); d != nil {
+				return *d
+			}
 			continue
 		}
 		// Resolve relative paths against project directory
@@ -620,6 +739,59 @@ func (v *Validator) validateContainerCreate(r *http.Request) Decision {
 	return allow("container create allowed")
 }
 
+// validateNamedVolume resolves a named volume on the daemon and decides
+// whether a container may bind it. Returns nil to allow.
+//
+// Three outcomes:
+//   - the volume does not exist: the daemon will create a plain local volume
+//     under its own data root, so there is no caller-chosen host path. Allow.
+//   - the volume exists with a "device" driver option: that option IS a host
+//     path (local-driver bind volumes are how a volume reaches host root), so
+//     it goes through exactly the same IsVolumePathAllowed check a Binds host
+//     path gets.
+//   - the volume exists on a non-local driver: a third-party volume plugin is
+//     a mount source this guard cannot reason about, the same reason
+//     HostConfig.VolumeDriver is denied.
+//
+// Anything the lookup cannot answer is denied. A guess here is worth nothing:
+// the whole point is that the name does not tell you what is behind it.
+func (v *Validator) validateNamedVolume(name string) *Decision {
+	if v.lookupVolume == nil {
+		d := deny(fmt.Sprintf("named volume %q cannot be validated: no daemon volume lookup is configured", name))
+		return &d
+	}
+	vol, err := v.lookupVolume(name)
+	if err != nil {
+		d := deny(fmt.Sprintf("named volume %q could not be resolved: %v", name, err))
+		return &d
+	}
+	if vol == nil {
+		return nil
+	}
+	if vol.Driver != "" && vol.Driver != "local" {
+		d := deny(fmt.Sprintf("named volume %q uses volume driver %q, which this guard cannot reason about",
+			name, vol.Driver))
+		return &d
+	}
+	device, ok := vol.Options["device"]
+	if !ok || device == "" {
+		return nil
+	}
+	// Require an absolute device. A relative one would be resolved against
+	// the GUARD process's working directory by IsVolumePathAllowed, which is
+	// not where the daemon would mount it, so allowing it would mean checking
+	// a different path from the one that gets mounted.
+	if !filepath.IsAbs(device) {
+		d := deny(fmt.Sprintf("named volume %q is backed by non-absolute device %q", name, device))
+		return &d
+	}
+	if !v.config.IsVolumePathAllowed(device) {
+		d := deny(fmt.Sprintf("named volume %q is backed by host path %q, which is not allowed", name, device))
+		return &d
+	}
+	return nil
+}
+
 // checkKnownKeys enforces the fail-closed field policy on a container-create
 // body: every top-level key must be in createKnownKeys and every HostConfig
 // key must be in hostConfigKnownKeys. A key that is on neither list is denied,
@@ -744,6 +916,17 @@ func (v *Validator) validateContainerExec(r *http.Request) Decision {
 	}
 
 	if len(bodyBytes) > 0 {
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &top); err != nil {
+			return deny(fmt.Sprintf("failed to parse exec request body: %v", err))
+		}
+		for key := range top {
+			if !execKnownKeys[key] {
+				return deny(fmt.Sprintf("exec create field %q is not permitted: "+
+					"this guard denies fields it has not reasoned about", key))
+			}
+		}
+
 		var req execCreateRequest
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			return deny(fmt.Sprintf("failed to parse exec request body: %v", err))
@@ -775,17 +958,52 @@ func (v *Validator) validateBuild(r *http.Request) Decision {
 		return deny("build is not allowed in read-only mode")
 	}
 
+	query := r.URL.Query()
+
+	// The build query string gets the same fail-closed discipline the create
+	// BODY has. It used to be unchecked apart from t=, which meant the
+	// namespace policy enforced at create simply did not exist on the build
+	// path: `docker build --network host` sends POST /build?networkmode=host
+	// and was allowed, and ?remote=URL made the DAEMON fetch a build context
+	// from anywhere (BWAICODE-5). Enumerating the dangerous parameters would
+	// repeat the mistake the HostConfig field policy already had to undo, so
+	// a parameter this guard has not reasoned about is denied.
+	for param := range query {
+		if !buildKnownParams[param] {
+			return deny(fmt.Sprintf("build parameter %q is not permitted: "+
+				"this guard denies parameters it has not reasoned about", param))
+		}
+	}
+
+	// remote= is denied outright: it is a server-side request issued by the
+	// daemon to a caller-chosen URL, which is exactly what this guard exists
+	// to mediate. A build context belongs in the request body.
+	if query.Has("remote") {
+		return deny("build parameter \"remote\" is not allowed: the daemon would fetch a build context from a caller-chosen URL")
+	}
+
+	// networkmode gets the create path's rule, for the same reasons: "host"
+	// joins the host network namespace, "container:<id>" joins another
+	// container's.
+	if nm := query.Get("networkmode"); nm == "host" || strings.HasPrefix(nm, "container:") {
+		return deny(fmt.Sprintf("build network mode %q is not allowed", nm))
+	}
+
 	// The resulting tag is the whole point: an unconstrained -t is how a
 	// caller mints an image name that later inherits trust at create time.
-	// Compose build-only services are already in the allowlist as
-	// "<project>-<service>" (bw-common.sh), so real builds pass this.
-	tags := r.URL.Query()["t"]
+	//
+	// Checked against BuildableImages, NOT the general image allowlist. The
+	// allowlist matches by name, so gating here on it allowed a build tagged
+	// exactly "postgres:16", which then shadows the registry image in the
+	// local cache for every later create (BWAICODE-2). BuildableImages holds
+	// only the compose services that declare build:, and matches exactly.
+	tags := query["t"]
 	if len(tags) == 0 {
-		return deny("build requires an explicit -t tag so the result can be checked against the allowlist")
+		return deny("build requires an explicit -t tag so the result can be checked against the buildable-image list")
 	}
 	for _, tag := range tags {
-		if !v.config.IsImageAllowed(tag) {
-			return deny(fmt.Sprintf("build tag %q is not in the allowlist", tag))
+		if !v.config.IsBuildTagAllowed(tag) {
+			return deny(fmt.Sprintf("build tag %q is not a buildable image for this project", tag))
 		}
 	}
 
@@ -877,11 +1095,11 @@ var globalReadPaths = map[string]bool{
 	"/networks":        true,
 	"/system/df":       true,
 	// /volumes is the volume LIST. It was briefly removed here on the theory
-	// that it gated the enumeration half of BWAICODE-4 (a Binds entry with
-	// no slash is treated as a named volume and never validated). It does
-	// not: /system/df and /containers/json, both above and both required,
-	// return the same volume names. The removal closed nothing and broke
-	// `docker volume ls`, so it is restored.
+	// that it gated the enumeration half of BWAICODE-4 (a Binds entry naming
+	// a volume). It does not: /system/df and /containers/json, both above and
+	// both required, return the same volume names. The removal closed nothing
+	// and broke `docker volume ls`, so it is restored. The mount half is now
+	// closed at the bind itself, by resolving the volume (validateNamedVolume).
 	"/volumes": true,
 	// Deliberately NOT here:
 	//

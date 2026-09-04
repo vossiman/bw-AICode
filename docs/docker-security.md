@@ -136,6 +136,13 @@ Sources scanned:
 
 From these, the proxy extracts: allowed images, allowed networks, compose project name.
 
+It also derives a separate, strictly smaller list: **buildable images**, the
+tags a `POST /build` may produce. These are the compose services that actually
+declare a `build:` section, named by their `image:` when they set one and
+`<project>-<service>` otherwise. `docker build` is checked against this list,
+not against the general image allowlist; see "Building images" below for why
+the two lists are not the same.
+
 ### Security enforcement
 
 The proxy is **deny-by-default**. Only explicitly modeled operations are allowed:
@@ -167,7 +174,12 @@ The proxy is **deny-by-default**. Only explicitly modeled operations are allowed
   resolve, symlinks included, under the project directory or an operator-set
   extra path) and a harmless `tmpfs` are permitted — `volume`, `npipe`,
   `cluster`, and a `volume`-typed mount carrying an inline bind
-  `DriverConfig` are all rejected. Dangerous flags are rejected
+  `DriverConfig` are all rejected. A `Binds` entry that names a **volume**
+  rather than a path is resolved against the daemon before it is allowed:
+  a volume that does not exist yet is fine (the daemon will create a plain
+  local one), a volume carrying a `device` driver option is checked against
+  the same path rules a host bind gets, and a volume on a third-party
+  driver is denied. Dangerous flags are rejected
   unconditionally, for every image including infra images:
   `--pid=host`, `--network=host`, `--userns=host`, `--ipc=host`
   (including `container:<id>` pivoting to a host-namespaced container),
@@ -185,15 +197,23 @@ The proxy is **deny-by-default**. Only explicitly modeled operations are allowed
   name. There is no name-prefix shortcut. **`exec` and `attach` are denied
   on seeded containers in every mode**: seeding exists so the session can
   manage buildkit's lifecycle, and that container runs privileged, so a
-  shell inside it is a host escape.
+  shell inside it is a host escape. The **exec create body** is held to the
+  same known-fields policy as container create: a field the guard has not
+  reasoned about is denied rather than forwarded unread.
 - **Image pull**: only allowlisted images, or an infra image matched by
   digest.
-- **Build**: requires every `-t` tag to be in the allowlist; an untagged
-  build is denied outright, because an untagged result can't be checked.
-  `/images/load` is denied in every mode: a loaded tar carries its own
-  repo-tags, which can't be checked without unpacking the stream, so it is
-  an unconstrained image-minting primitive with no cheaper fix than denial.
-  Use `--full-docker` if you genuinely need either.
+- **Build**: requires every `-t` tag to be in the **buildable-image** list,
+  matched exactly (`myproj-app` and `myproj-app:latest` are the same tag; a
+  digest is not). An untagged build is denied outright, because an untagged
+  result can't be checked. The build **query string** gets the same
+  fail-closed treatment as the create body: a parameter the guard has not
+  reasoned about is denied, `?remote=URL` is denied outright (it makes the
+  daemon fetch a build context from a caller-chosen URL), and
+  `?networkmode=` is held to the same rule as `NetworkMode` at container
+  create. `/images/load` is denied in every mode: a loaded tar carries its
+  own repo-tags, which can't be checked without unpacking the stream, so it
+  is an unconstrained image-minting primitive with no cheaper fix than
+  denial. Use `--full-docker` if you genuinely need either.
 - **Network create/delete**: only allowlisted networks.
 - **Everything else**: blocked (Swarm, secrets, plugins, volume create, etc.)
 
@@ -266,7 +286,7 @@ the user's build.
 
 ### What stops working, plainly
 
-Two of the changes above have costs an operator will hit. Neither is a bug.
+Four of the changes above have costs an operator will hit. None is a bug.
 
 **The buildx `docker-container` driver does not work through the guard for
 BUILDS.** That driver builds by exec'ing into the builder container (a real
@@ -278,6 +298,20 @@ cache export/import (`--cache-to` / `--cache-from`)**. Plain `docker build` and
 `docker compose build` use the default `docker` driver, which goes through
 `POST /build`, and are unaffected. Run a docker-container build outside the
 sandbox, or with `--full-docker`.
+
+**Only a compose service with a `build:` section can be built.** `docker build
+-t <tag>` now needs `<tag>` to be in the buildable-image list, so an ad-hoc
+build of a tag the project never declares is denied, including a build tagged
+as an image the project merely *pulls*. That is the point (BWAICODE-2): a
+build tagged `postgres:16` would otherwise shadow the pullable image in the
+local cache. Declare the service with a `build:` section, or use
+`--full-docker`.
+
+**BuildKit builds do not go through `POST /build` at all.** The CLI's default
+builder drives `POST /session` and `POST /grpc`, neither of which is a modelled
+route, so the write model denies them. Classic builds work
+(`DOCKER_BUILDKIT=0`, which the API records as `version=1`). This predates the
+build-parameter policy and is not changed by it.
 
 **The fail-closed field policy denies flags that used to work.** Today that
 means `--sysctl`, `--runtime`, `--storage-opt` and `--annotation` (all
@@ -325,18 +359,18 @@ widen the policy.
 ### Known residuals (open, not hidden)
 
 These are real gaps in the current implementation, tracked as tickets rather
-than silently accepted:
+than silently accepted.
 
-- **BWAICODE-4 — named-volume binds are not validated.** A `Binds` entry
-  with no slash in the host portion (`Binds: ["somevol:/host"]`) is treated
-  as a Docker-managed named volume and skips validation entirely. If a
-  host-backed named volume already exists (created before the guard ever
-  saw a request, since `POST /volumes/create` is itself denied as an
-  unmodelled route), attaching it still reaches host data. A regression
-  gate deliberately locks in this permissive behaviour today and fails the
-  build the moment it is fixed, specifically so the fix can't land silently
-  — see `internal/guard/escape_test.go`,
-  `mount_spelling4_named_volume_bind_is_a_KNOWN_RESIDUAL`.
+Closed since the CAF-001 rewrite, listed here because earlier revisions of
+this document described them as open: **BWAICODE-2** (a build could tag itself
+as a pullable allowlisted image), **BWAICODE-3** (socket denial did not cover
+ancestor directories such as `/var`), **BWAICODE-4** (named-volume binds were
+not validated) and **BWAICODE-5** (the build query string was unchecked apart
+from `-t`). Each has a regression gate; see `internal/guard/escape_test.go`
+and the `BWAICODE-*` cases in `test/integration_test.sh`.
+
+Still open:
+
 - **Volume names are host-wide visible** via `/volumes`, `/system/df`
   (`Volumes[].Name`, `Mountpoint`) and `/containers/json`
   (`Mounts[].Name`) — all three needed for basic `docker ps`/`docker volume
@@ -348,16 +382,22 @@ than silently accepted:
   stream it also leaks event timing and action detail, including
   `exec_create: <cmd>` — other projects' exec command lines and arguments,
   not just their existence.
-- **BWAICODE-2 — the image allowlist matches by name, not content.** A
-  build tagged exactly `postgres:16` (an allowlisted name) poisons the
-  local image cache under that name even though its content differs from
-  the real `postgres:16`. This is a name allowlist, not a content-integrity
-  guarantee; only the separate digest-matched infra path carries that
-  stronger property.
-- **BWAICODE-3 — socket denial doesn't cover ancestor directories.** The
-  check rejects the Docker/Podman socket path itself and its known
-  basenames, but not a bind of an ancestor directory such as `/var` that
-  would contain the socket anyway.
+- **The image allowlist matches by name, not content.** Allowlisted
+  application images are matched by name so that an untagged pull resolves,
+  which means the allowlist is *not* a content-integrity guarantee: it says
+  which names may run, not what is behind them. Only the digest-matched
+  infra path carries the stronger property. What is closed (BWAICODE-2) is
+  the way a *build* could exploit that: builds are checked against the
+  separate buildable-image list, so a build can no longer tag itself
+  `postgres:16` and shadow the pullable image in the local cache.
+- **An operator can still allowlist a directory that merely *contains* a
+  symlink to a socket.** The guard refuses, at config load, a
+  `volume_mount_root` or `BW_EXTRA_VOLUME_PATHS` entry that is a socket
+  path, a directory holding one, or an ancestor of one: `/var` and `/` are
+  refused loudly rather than silently losing a later comparison. What it
+  does not do is walk an allowlisted tree looking for symlinks that lead to
+  a socket. Allowlisting a directory you do not control remains an operator
+  decision the guard cannot audit for you.
 - **Validate-time symlink resolution is TOCTOU-racy against daemon-time
   mounting.** The guard resolves symlinks when it validates a request, but
   the daemon resolves and mounts the path later; a path that is swapped out

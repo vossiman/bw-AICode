@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -33,11 +34,60 @@ var socketParentDirs = map[string]bool{
 	"/run":     true,
 }
 
+// socketAncestorCandidates are the paths whose exposure the ancestor check
+// guards: every known socket, plus the rootless runtime dir resolved at call
+// time. Sorted so an error message names the same socket every run.
+func socketAncestorCandidates() []string {
+	out := make([]string, 0, len(knownSocketPaths)+1)
+	for p := range knownSocketPaths {
+		out = append(out, p)
+	}
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+		out = append(out, filepath.Join(filepath.Clean(xdg), "docker.sock"))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// socketAncestor returns the first known socket path that lives beneath
+// cleanPath, or "" if none does.
+//
+// isSocketPath only recognises an enumerated set: the socket paths themselves,
+// their immediate parent dirs, the basename and the rootless runtime dir. It
+// says false for "/var" and for "/", both of which expose /var/run/docker.sock
+// to anything that mounts them. Those were denied only because they lost the
+// AllowedVolumePaths and VolumeMountRoot comparisons further down, i.e. by the
+// allowlist being sane rather than by the socket rule. An operator who put
+// "/var" in BW_EXTRA_VOLUME_PATHS re-opened full daemon access and nothing
+// said so. This closes the gap by treating containment the same as identity.
+func socketAncestor(cleanPath string) string {
+	prefix := cleanPath
+	if prefix != "/" {
+		prefix += "/"
+	}
+	for _, sock := range socketAncestorCandidates() {
+		if strings.HasPrefix(sock, prefix) {
+			return sock
+		}
+	}
+	return ""
+}
+
 type Config struct {
-	ProjectDir         string   `json:"project_dir"`
-	ComposeProject     string   `json:"compose_project"`
-	AllowedImages      []string `json:"allowed_images"`
-	AllowedNetworks    []string `json:"allowed_networks"`
+	ProjectDir      string   `json:"project_dir"`
+	ComposeProject  string   `json:"compose_project"`
+	AllowedImages   []string `json:"allowed_images"`
+	AllowedNetworks []string `json:"allowed_networks"`
+	// BuildableImages are the tags POST /build may produce: the compose
+	// services that actually declare a build: section, resolved host-side by
+	// bw-common.sh. A strict subset of AllowedImages.
+	//
+	// It is separate from AllowedImages because AllowedImages matches by NAME
+	// (see IsImageAllowed), so gating builds on it let a build tagged exactly
+	// "postgres:16" shadow the registry image in the local cache and be run
+	// by any later create (BWAICODE-2). A name only a build produces cannot
+	// shadow anything.
+	BuildableImages    []string `json:"buildable_images"`
 	VolumeMountRoot    string   `json:"volume_mount_root"`
 	AllowedVolumePaths []string `json:"allowed_volume_paths"`
 	// InfraImageDigests are exact content digests ("sha256:...") of Docker's
@@ -128,6 +178,44 @@ func (c *Config) IsImageAllowed(image string) bool {
 	return false
 }
 
+// canonicalTag normalizes a build tag for exact comparison: it drops the
+// Docker Hub prefix and makes the implicit ":latest" explicit, so that
+// "proj-app" and "proj-app:latest", the same image to the daemon, compare
+// equal. A reference carrying a digest is left alone.
+func canonicalTag(ref string) string {
+	ref = normalizeImage(ref)
+	if strings.Contains(ref, "@") {
+		return ref
+	}
+	// A colon in the last path segment is the tag; a colon earlier is a
+	// registry port ("localhost:5000/img").
+	last := ref
+	if i := strings.LastIndex(ref, "/"); i != -1 {
+		last = ref[i+1:]
+	}
+	if !strings.Contains(last, ":") {
+		return ref + ":latest"
+	}
+	return ref
+}
+
+// IsBuildTagAllowed reports whether a POST /build may produce this tag.
+//
+// Matching is EXACT (modulo the implicit ":latest"), never by name. That is
+// the whole point: IsImageAllowed matches by name so an untagged pull can
+// resolve, and gating builds on it meant a build tagged "postgres:16" was
+// allowed because "postgres" was allowlisted, and then shadowed the registry
+// image in the local cache for every later create (BWAICODE-2).
+func (c *Config) IsBuildTagAllowed(tag string) bool {
+	norm := canonicalTag(tag)
+	for _, allowed := range c.BuildableImages {
+		if norm == canonicalTag(allowed) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsNetworkAllowed checks if the given network name is in the allowlist.
 func (c *Config) IsNetworkAllowed(name string) bool {
 	for _, allowed := range c.AllowedNetworks {
@@ -178,6 +266,14 @@ func (c *Config) IsVolumePathAllowed(hostPath string) bool {
 	// BEFORE AllowedVolumePaths: an explicit entry used to override it, which
 	// turned any path reaching the allowlist into a socket mount (CAF-001).
 	if isSocketPath(cleanPath) || isSocketPath(resolved) {
+		return false
+	}
+
+	// A directory that CONTAINS a socket is denied on the same grounds; see
+	// socketAncestor. Load() already refuses such an entry in the allowlist,
+	// so this is the second layer, covering a VolumeMountRoot or a resolved
+	// symlink target that reaches one at request time.
+	if socketAncestor(cleanPath) != "" || socketAncestor(resolved) != "" {
 		return false
 	}
 
@@ -250,5 +346,39 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// Refuse an allowlist that would expose a Docker socket, LOUDLY and at
+	// load time. The request path denies these too, but silently and one
+	// request at a time; an operator who wrote "/var" into
+	// BW_EXTRA_VOLUME_PATHS should be told that the entry cannot be honoured
+	// rather than watch every mount fail for no stated reason.
+	if err := validateNoSocketExposure(&cfg); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// validateNoSocketExposure rejects a VolumeMountRoot or AllowedVolumePaths
+// entry that is a Docker/Podman socket, a directory holding one, or an
+// ancestor of one.
+func validateNoSocketExposure(cfg *Config) error {
+	check := func(field, path string) error {
+		clean := filepath.Clean(path)
+		if isSocketPath(clean) {
+			return fmt.Errorf("%s %q is a Docker socket path and cannot be mounted", field, path)
+		}
+		if sock := socketAncestor(clean); sock != "" {
+			return fmt.Errorf("%s %q contains the Docker socket %q and cannot be mounted", field, path, sock)
+		}
+		return nil
+	}
+	if err := check("volume_mount_root", cfg.VolumeMountRoot); err != nil {
+		return err
+	}
+	for _, p := range cfg.AllowedVolumePaths {
+		if err := check("allowed_volume_paths entry", p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
