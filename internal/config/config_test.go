@@ -360,3 +360,135 @@ func TestIsInfraImageRequiresExactDigest(t *testing.T) {
 		}
 	})
 }
+
+// --- BWAICODE-3: socket ancestors ---
+
+func TestLoadRejectsSocketAncestorInAllowlist(t *testing.T) {
+	for _, entry := range []string{"/var", "/", "/run", "/var/run/docker.sock"} {
+		t.Run(entry, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.json")
+			body := `{
+				"project_dir": "` + dir + `",
+				"allowed_images": ["postgres:16"],
+				"allowed_volume_paths": ["` + entry + `"]
+			}`
+			if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("Load accepted allowed_volume_paths entry %q; want a refusal", entry)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsSocketAncestorAsVolumeMountRoot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{
+		"project_dir": "` + dir + `",
+		"allowed_images": ["postgres:16"],
+		"volume_mount_root": "/var"
+	}`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load accepted volume_mount_root /var; want a refusal")
+	}
+}
+
+func TestLoadAcceptsOrdinaryPaths(t *testing.T) {
+	dir := t.TempDir()
+	extra := filepath.Join(dir, "extra")
+	if err := os.MkdirAll(extra, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	body := `{
+		"project_dir": "` + dir + `",
+		"allowed_images": ["postgres:16"],
+		"allowed_volume_paths": ["` + extra + `"]
+	}`
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load rejected an ordinary allowlist entry: %v", err)
+	}
+}
+
+// An operator-allowlisted ancestor of the socket must lose even if Load is
+// bypassed, i.e. the request path does not rely on the allowlist being sane.
+func TestIsVolumePathAllowedDeniesSocketAncestor(t *testing.T) {
+	cfg := &Config{
+		VolumeMountRoot:    "/project",
+		AllowedVolumePaths: []string{"/var", "/"},
+	}
+	for _, p := range []string{"/var", "/"} {
+		if cfg.IsVolumePathAllowed(p) {
+			t.Errorf("IsVolumePathAllowed(%q) = true; a directory containing the Docker socket must be denied", p)
+		}
+	}
+}
+
+// --- BWAICODE-2: build tags are matched exactly, against a separate list ---
+
+func TestIsBuildTagAllowed(t *testing.T) {
+	cfg := &Config{
+		AllowedImages:   []string{"postgres:16", "mcp/postgres", "myproj-app"},
+		BuildableImages: []string{"myproj-app", "myreg/web:1"},
+	}
+
+	allowed := []string{"myproj-app", "myproj-app:latest", "myreg/web:1"}
+	for _, tag := range allowed {
+		if !cfg.IsBuildTagAllowed(tag) {
+			t.Errorf("IsBuildTagAllowed(%q) = false; a compose build service must be buildable", tag)
+		}
+	}
+
+	// The BWAICODE-2 primitive: these all pass IsImageAllowed, and none of
+	// them may be produced by a build.
+	denied := []string{"postgres:16", "postgres:evil", "postgres", "mcp/postgres", "myreg/web:2", "myproj-app@sha256:abc"}
+	for _, tag := range denied {
+		if cfg.IsBuildTagAllowed(tag) {
+			t.Errorf("IsBuildTagAllowed(%q) = true; a build must not mint a name that resolves elsewhere", tag)
+		}
+	}
+}
+
+func TestIsBuildTagAllowedEmptyListBuildsNothing(t *testing.T) {
+	cfg := &Config{AllowedImages: []string{"postgres:16"}}
+	if cfg.IsBuildTagAllowed("postgres:16") {
+		t.Error("a project with no buildable services must not be able to build anything")
+	}
+}
+
+// The "library/" prefix is Docker Hub's official-images namespace, and a Hub
+// repository path is exactly namespace/name. Stripping it unconditionally made
+// "library/acme/widget" compare equal to "acme/widget", which are two distinct
+// repositories on a real daemon (verified against docker 29.7.2), and that
+// equivalence let a build mint a tag absent from BuildableImages.
+func TestLibraryPrefixOnlyCollapsesSingleComponentNames(t *testing.T) {
+	cfg := &Config{BuildableImages: []string{"library/acme/widget"}}
+	if cfg.IsBuildTagAllowed("acme/widget") {
+		t.Error("acme/widget matched buildable library/acme/widget; they are distinct repositories")
+	}
+	if !cfg.IsBuildTagAllowed("library/acme/widget") {
+		t.Error("a buildable image no longer matches itself")
+	}
+
+	// The two-component case is a genuine alias and must keep matching, in
+	// both directions.
+	official := &Config{
+		AllowedImages:   []string{"library/alpine:3"},
+		BuildableImages: []string{"library/myapp"},
+	}
+	if !official.IsImageAllowed("alpine:3") {
+		t.Error("alpine:3 no longer matches allowlisted library/alpine:3")
+	}
+	if !official.IsBuildTagAllowed("myapp") {
+		t.Error("myapp no longer matches buildable library/myapp")
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"time"
 
 	"github.com/vossi/bw-docker-guard/internal/config"
 	"github.com/vossi/bw-docker-guard/internal/guard"
@@ -27,6 +28,7 @@ type createResponse struct {
 // Denied requests get a 403 with a JSON body.
 func NewHandler(cfg *config.Config, tracker *ownership.Tracker, dockerSocketPath string) http.Handler {
 	validator := guard.NewValidator(cfg, tracker)
+	validator.SetVolumeLookup(newVolumeLookup(dockerSocketPath))
 
 	target, _ := url.Parse("http://docker")
 	proxy := httputil.NewSingleHostReverseProxy(target)
@@ -158,4 +160,45 @@ func extractID(resp *http.Response) (string, error) {
 	}
 
 	return cr.ID, nil
+}
+
+// volumeLookupTimeout bounds the extra daemon round-trip a named-volume bind
+// costs. It only runs on container create, and only for a Binds entry that
+// names a volume, so it is not in the general request path.
+const volumeLookupTimeout = 5 * time.Second
+
+// newVolumeLookup returns a guard.VolumeLookup backed by the same Docker
+// socket the proxy forwards to. The guard needs it to tell a Docker-managed
+// named volume from one created with device=/,o=bind, which the name alone
+// does not reveal (BWAICODE-4).
+func newVolumeLookup(dockerSocketPath string) guard.VolumeLookup {
+	client := &http.Client{
+		Timeout: volumeLookupTimeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", dockerSocketPath)
+			},
+		},
+	}
+	return func(name string) (*guard.VolumeInfo, error) {
+		resp, err := client.Get("http://docker/volumes/" + url.PathEscape(name))
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			// No such volume: the daemon will create a plain local one.
+			return nil, nil
+		case http.StatusOK:
+		default:
+			return nil, fmt.Errorf("volume inspect returned %s", resp.Status)
+		}
+		var info guard.VolumeInfo
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&info); err != nil {
+			return nil, fmt.Errorf("decoding volume inspect response: %w", err)
+		}
+		return &info, nil
+	}
 }

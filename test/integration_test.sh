@@ -593,6 +593,116 @@ stop_guard
 rm -rf /tmp/test-project
 
 # ============================================================
+# Test 4: the residuals closed after the CAF-001 rewrite
+# (BWAICODE-2 build tags, -3 socket ancestors, -4 named volumes,
+#  -5 the build query string). Against the REAL daemon, because each
+# of these is about what Docker actually sends or actually stores.
+# ============================================================
+echo ""
+echo "--- Residual fixes (BWAICODE-2..5) ---"
+
+mkdir -p /tmp/test-project
+
+# BWAICODE-3: a config whose allowlist contains a directory holding the
+# Docker socket must be refused at LOAD, not silently at request time.
+ancestor_cfg="$(mktemp /tmp/guard-test-XXXXXX.json)"
+cat > "$ancestor_cfg" <<'EOF'
+{
+  "project_dir": "/tmp/test-project",
+  "allowed_images": ["alpine:latest"],
+  "allowed_networks": [],
+  "volume_mount_root": "/tmp/test-project",
+  "allowed_volume_paths": ["/var"]
+}
+EOF
+sock="/tmp/bw-docker-guard-ancestor-$$.sock"
+if output="$("$GUARD_BIN" --config "$ancestor_cfg" --socket "$sock" 2>&1)"; then
+  fail "BWAICODE-3: /var in the allowlist" "the guard started; it must refuse to load"
+else
+  if echo "$output" | grep -qi "docker socket"; then
+    ok "BWAICODE-3: /var in allowed_volume_paths refused at load"
+  else
+    fail "BWAICODE-3: /var in the allowlist" "refused, but not for the socket reason: ${output:0:120}"
+  fi
+fi
+rm -f "$ancestor_cfg" "$sock"
+
+# The remaining cases share one guard.
+config_file="$(mktemp /tmp/guard-test-XXXXXX.json)"
+cat > "$config_file" <<'EOF'
+{
+  "project_dir": "/tmp/test-project",
+  "compose_project": "test-project",
+  "allowed_images": ["alpine:latest", "alpine", "test-project-app"],
+  "buildable_images": ["test-project-app"],
+  "allowed_networks": ["test-project_default"],
+  "volume_mount_root": "/tmp/test-project"
+}
+EOF
+start_guard "$config_file"
+
+# BWAICODE-4: a REAL local-driver bind volume pointing at host root. This is
+# the precondition the finding describes; the guard has to resolve the name.
+hostvol="bwtest-hostroot-$$"
+if docker volume create --driver local      --opt type=none --opt device=/ --opt o=bind "$hostvol" >/dev/null 2>&1; then
+  output="$(docker_via_guard run --rm -v "$hostvol":/host alpine echo hi 2>&1 || true)"
+  if echo "$output" | grep -q "^hi$"; then
+    fail "BWAICODE-4: host-backed named volume" "container ran with host root mounted"
+  else
+    ok "BWAICODE-4: host-backed named volume blocked (${output:0:80})"
+  fi
+
+  # Positive control: an ordinary Docker-managed volume still mounts.
+  okvol="bwtest-ordinary-$$"
+  docker volume create "$okvol" >/dev/null 2>&1
+  output="$(docker_via_guard run --rm -v "$okvol":/data alpine echo hi 2>&1 || true)"
+  if echo "$output" | grep -q "^hi$"; then
+    ok "BWAICODE-4: ordinary named volume still works"
+  else
+    fail "BWAICODE-4: ordinary named volume" "denied, but it is Docker-managed: ${output:0:120}"
+  fi
+  docker volume rm -f "$okvol" >/dev/null 2>&1 || true
+  docker volume rm -f "$hostvol" >/dev/null 2>&1 || true
+else
+  skip "BWAICODE-4: host-backed named volume" "could not create the test volume"
+fi
+
+# BWAICODE-5: --network host on the BUILD path. Captured live, this sends
+# POST /build?networkmode=host, which the create path would have denied.
+build_ctx="/tmp/test-project/buildctx"
+mkdir -p "$build_ctx"
+printf 'FROM alpine:latest\n' > "$build_ctx/Dockerfile"
+output="$(DOCKER_BUILDKIT=0 DOCKER_HOST="unix://$GUARD_SOCKET" \
+  docker build --network host -t test-project-app "$build_ctx" 2>&1 || true)"
+if echo "$output" | grep -qi "network mode"; then
+  ok "BWAICODE-5: docker build --network host blocked"
+else
+  fail "BWAICODE-5: build --network host" "not blocked: ${output:0:160}"
+fi
+
+# BWAICODE-2: a build may not tag itself as a pullable allowlisted image.
+output="$(DOCKER_BUILDKIT=0 DOCKER_HOST="unix://$GUARD_SOCKET" \
+  docker build -t alpine:latest "$build_ctx" 2>&1 || true)"
+if echo "$output" | grep -qi "buildable"; then
+  ok "BWAICODE-2: build shadowing an allowlisted image blocked"
+else
+  fail "BWAICODE-2: build -t alpine:latest" "not blocked: ${output:0:160}"
+fi
+
+# Positive control: the project's own buildable tag still builds.
+output="$(DOCKER_BUILDKIT=0 DOCKER_HOST="unix://$GUARD_SOCKET" \
+  docker build -t test-project-app "$build_ctx" 2>&1 || true)"
+if echo "$output" | grep -qi "denied\|forbidden\|403"; then
+  fail "BWAICODE-2: buildable tag" "the project's own build was denied: ${output:0:160}"
+else
+  ok "BWAICODE-2: the project's own buildable tag still builds"
+fi
+docker rmi -f test-project-app >/dev/null 2>&1 || true
+
+stop_guard
+rm -rf /tmp/test-project
+
+# ============================================================
 # Summary
 # ============================================================
 echo ""

