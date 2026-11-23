@@ -106,6 +106,23 @@ build_bwrap_args() {
   done
 }
 
+# --- aicoding-managed tool releases ---
+# aicoding installs each tool as a launcher in ~/.local/bin that execs into
+# ~/.local/share/aicoding/current/<tool>, a symlink to versions/<tool>/<ver>.
+# Bind the symlink dir and the one resolved release read-only, so the
+# launcher resolves inside the sandbox without exposing other releases.
+# No-op when the tool is not aicoding-managed.
+# Usage: add_managed_tool_binds BINDS tool
+add_managed_tool_binds() {
+  local -n _mbinds=$1
+  local current="$HOME/.local/share/aicoding/current"
+  local release
+  [[ -L "$current/$2" ]] || return 0
+  release="$(readlink -f "$current/$2")" || return 0
+  [[ -d "$release" ]] || return 0
+  _mbinds+=("ro $current" "ro $release")
+}
+
 # --- Symlink target resolution ---
 # Recursively scans scan_root (bounded depth, default 3) for symlinks and
 # appends their resolved targets to the named output array, so callers can
@@ -372,7 +389,7 @@ derive_docker_allowlist() {
     local buildkit_digests
     buildkit_digests="$(docker image inspect \
       --format '{{range .RepoDigests}}{{println .}}{{end}}' \
-      moby/buildkit 2>/dev/null | sed -n 's/.*@//p' | sort -u)"
+      moby/buildkit 2>/dev/null | sed -n 's/.*@//p' | sort -u || true)"
     if [[ -n "$buildkit_digests" ]]; then
       infra_digests_json="$(printf '%s\n' "$buildkit_digests" | jq -R . | jq -s 'map(select(. != ""))')"
     fi
@@ -384,7 +401,7 @@ derive_docker_allowlist() {
     # as InfraImageDigests above. Seed both the container's full ID and its
     # name so a request addressed either way resolves.
     local buildkit_image_ids preowned=""
-    buildkit_image_ids="$(docker images -q moby/buildkit 2>/dev/null | sort -u)"
+    buildkit_image_ids="$(docker images -q moby/buildkit 2>/dev/null | sort -u || true)"
     if [[ -n "$buildkit_image_ids" ]]; then
       while IFS= read -r img_id; do
         [[ -z "$img_id" ]] && continue

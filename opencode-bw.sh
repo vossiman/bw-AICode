@@ -56,6 +56,7 @@ BINDS=(
   "rw! $HOME/.local/state/opencode"
   "rw! $HOME/.cache/opencode"
 )
+add_managed_tool_binds BINDS opencode
 
 # Overlay binds — placed after --tmpfs /tmp and --tmpfs /run
 OVERLAY_BINDS=(

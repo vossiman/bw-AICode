@@ -32,6 +32,7 @@ BINDS=(
   # Claude desktop config
   "ro $HOME/.config/Claude"
 )
+add_managed_tool_binds BINDS claude
 
 # Overlay binds — placed after --tmpfs /tmp and --tmpfs /run
 OVERLAY_BINDS=(

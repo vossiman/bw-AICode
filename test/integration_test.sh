@@ -279,6 +279,71 @@ rm -rf "$SHAPE_TEST_HOME"
 rm -rf "$BIND_TEST_HOME"
 
 # ============================================================
+# Test 0e: a host without moby/buildkit must not kill the wrapper.
+# The wrappers run under set -euo pipefail, so a failing docker probe in a
+# pipeline used to exit the whole wrapper silently. A docker stub that
+# fails every call stands in for "image not pulled" and "daemon down".
+# ============================================================
+echo ""
+echo "--- derive_docker_allowlist without moby/buildkit ---"
+
+NOBK_TEST_HOME="$(mktemp -d /tmp/bw-nobk-test-XXXXXX)"
+mkdir -p "$NOBK_TEST_HOME/project" "$NOBK_TEST_HOME/bin"
+printf '#!/bin/sh\nexit 1\n' > "$NOBK_TEST_HOME/bin/docker"
+chmod +x "$NOBK_TEST_HOME/bin/docker"
+
+nobk_out="$(
+  cd "$NOBK_TEST_HOME/project" || exit 1
+  PATH="$NOBK_TEST_HOME/bin:$PATH" bash -c '
+    set -euo pipefail
+    source "$1/bw-common.sh"
+    derive_docker_allowlist 2>/dev/null
+    echo "REACHED $BW_DOCKER_GUARD_CONFIG"
+  ' _ "$PROJECT_DIR"
+)" || true
+nobk_config="$(sed -n 's/^REACHED //p' <<< "$nobk_out")"
+if [[ -n "$nobk_config" ]]; then
+  ok "derive_docker_allowlist survives a failing docker under pipefail"
+else
+  fail "derive_docker_allowlist without moby/buildkit" "wrapper exited before the guard config was written"
+fi
+[[ -n "$nobk_config" ]] && rm -f "$nobk_config"
+rm -rf "$NOBK_TEST_HOME"
+
+# ============================================================
+# Test 0f: aicoding-managed launchers resolve inside the sandbox.
+# aicoding installs ~/.local/bin/<tool> as a launcher into
+# ~/.local/share/aicoding/current/<tool> -> versions/<tool>/<ver>.
+# Only the symlink dir and the active release may be bound.
+# ============================================================
+echo ""
+echo "--- aicoding-managed tool binds ---"
+
+MGD_TEST_HOME="$(mktemp -d /tmp/bw-managed-test-XXXXXX)"
+mgd_share="$MGD_TEST_HOME/.local/share/aicoding"
+mkdir -p "$mgd_share/current" "$mgd_share/versions/pi/1.0" "$mgd_share/versions/pi/0.9" \
+         "$mgd_share/versions/claude/2.0"
+ln -s ../versions/pi/1.0 "$mgd_share/current/pi"
+
+mgd_out="$(
+  HOME="$MGD_TEST_HOME" bash -c '
+    set -euo pipefail
+    source "$1/bw-common.sh"
+    B=()
+    add_managed_tool_binds B pi
+    add_managed_tool_binds B claude
+    printf "%s\n" "${B[@]}"
+  ' _ "$PROJECT_DIR"
+)" || true
+mgd_want="$(printf 'ro %s\nro %s' "$mgd_share/current" "$mgd_share/versions/pi/1.0")"
+if [[ "$mgd_out" == "$mgd_want" ]]; then
+  ok "managed tool binds cover the active release only"
+else
+  fail "aicoding-managed tool binds" "got: $(tr '\n' '|' <<< "$mgd_out")"
+fi
+rm -rf "$MGD_TEST_HOME"
+
+# ============================================================
 # Test 0d: docs must not claim behaviour the code does not have
 # ============================================================
 echo ""

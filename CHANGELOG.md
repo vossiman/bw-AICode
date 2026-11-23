@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fix: wrappers start on aicoding-managed hosts
+
+- **A host without `moby/buildkit` no longer kills every wrapper.** The
+  buildkit probes in `derive_docker_allowlist` ran inside pipelines under
+  `set -euo pipefail`, so a missing image (or a stopped daemon) made the
+  wrapper exit silently before the sandbox started.
+- **`claude-bw`, `opencode-bw` and `pi-bw` now follow aicoding launchers.**
+  aicoding installs `~/.local/bin/<tool>` as a launcher into
+  `~/.local/share/aicoding/current/<tool>`, which the sandbox never mounted, so
+  the launcher exited 1. `add_managed_tool_binds` binds that symlink dir and
+  the active release read-only; other releases stay invisible.
+- **`pi-bw` puts the host's node first on the sandbox PATH**, so pi does not
+  fall back to an older `/usr/bin/node`.
+
 ### Security: the four residuals left open by the CAF-001 rewrite
 
 The rewrite below closed the escape chain and left four findings filed rather
