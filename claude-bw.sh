@@ -32,7 +32,8 @@ BINDS=(
   # Claude desktop config
   "ro $HOME/.config/Claude"
 )
-add_managed_tool_binds BINDS claude
+BW_MANAGED_ARGS=()
+add_managed_tool_binds BINDS BW_MANAGED_ARGS claude
 
 # Overlay binds — placed after --tmpfs /tmp and --tmpfs /run
 OVERLAY_BINDS=(
@@ -55,6 +56,7 @@ build_bwrap_args OVERLAY_BINDS BWRAP_OVERLAY_ARGS
 BWRAP_CMD=(
   bwrap
   "${BWRAP_ARGS[@]}"
+  "${BW_MANAGED_ARGS[@]}"
   --proc /proc
   --dev /dev
   --tmpfs /dev/shm

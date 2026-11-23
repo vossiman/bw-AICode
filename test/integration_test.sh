@@ -180,8 +180,7 @@ YAML
   fi
   echo "OK compose binds did not reach the allowlist"
   exit 0
-)
-bind_test_rc=$?
+) && bind_test_rc=0 || bind_test_rc=$?
 case $bind_test_rc in
   0) ok "compose binds excluded from allowed_volume_paths" ;;
   2) skip "compose bind harvesting" "docker compose unavailable" ;;
@@ -266,8 +265,7 @@ mkdir -p "$SHAPE_TEST_HOME/project"
 
   echo "OK preowned_containers carries full 64-char IDs"
   exit 0
-)
-shape_test_rc=$?
+) && shape_test_rc=0 || shape_test_rc=$?
 case $shape_test_rc in
   0) ok "preowned_containers seeds full (untruncated) container IDs" ;;
   2) skip "preowned_containers ID shape" "docker unavailable or setup failed" ;;
@@ -294,7 +292,7 @@ chmod +x "$NOBK_TEST_HOME/bin/docker"
 
 nobk_out="$(
   cd "$NOBK_TEST_HOME/project" || exit 1
-  PATH="$NOBK_TEST_HOME/bin:$PATH" bash -c '
+  HOME="$NOBK_TEST_HOME" PATH="$NOBK_TEST_HOME/bin:$PATH" bash -c '
     set -euo pipefail
     source "$1/bw-common.sh"
     derive_docker_allowlist 2>/dev/null
@@ -312,34 +310,47 @@ rm -rf "$NOBK_TEST_HOME"
 
 # ============================================================
 # Test 0f: aicoding-managed launchers resolve inside the sandbox.
-# aicoding installs ~/.local/bin/<tool> as a launcher into
-# ~/.local/share/aicoding/current/<tool> -> versions/<tool>/<ver>.
-# Only the symlink dir and the active release may be bound.
+# A launcher's `current=` line names <data>/current/<tool>, a symlink to
+# <data>/versions/<tool>/<ver>. Only that release is bound, the sandbox gets
+# its own pinned `current` symlink, and a pointer outside versions/<tool> is
+# refused. The data dir is deliberately not ~/.local/share/aicoding.
 # ============================================================
 echo ""
 echo "--- aicoding-managed tool binds ---"
 
 MGD_TEST_HOME="$(mktemp -d /tmp/bw-managed-test-XXXXXX)"
-mgd_share="$MGD_TEST_HOME/.local/share/aicoding"
-mkdir -p "$mgd_share/current" "$mgd_share/versions/pi/1.0" "$mgd_share/versions/pi/0.9" \
-         "$mgd_share/versions/claude/2.0"
-ln -s ../versions/pi/1.0 "$mgd_share/current/pi"
+mgd_data="$MGD_TEST_HOME/custom-data"
+mkdir -p "$mgd_data/current" "$mgd_data/versions/pi/1.0" "$mgd_data/versions/pi/0.9" \
+         "$mgd_data/versions/claude/2.0" "$MGD_TEST_HOME/outside" "$MGD_TEST_HOME/bin"
+ln -s ../versions/pi/1.0 "$mgd_data/current/pi"
+ln -s ../../outside "$mgd_data/current/claude"
+for t in pi claude opencode; do
+  printf '#!/usr/bin/env bash\n# Managed by aicoding immutable runtime.\ncurrent=%s\n' \
+    "$mgd_data/current/$t" > "$MGD_TEST_HOME/bin/$t"
+  chmod +x "$MGD_TEST_HOME/bin/$t"
+done
 
 mgd_out="$(
-  HOME="$MGD_TEST_HOME" bash -c '
+  HOME="$MGD_TEST_HOME" PATH="$MGD_TEST_HOME/bin:$PATH" bash -c '
     set -euo pipefail
     source "$1/bw-common.sh"
-    B=()
-    add_managed_tool_binds B pi
-    add_managed_tool_binds B claude
-    printf "%s\n" "${B[@]}"
-  ' _ "$PROJECT_DIR"
+    B=() A=()
+    for t in pi claude opencode; do add_managed_tool_binds B A "$t"; done
+    printf "B %s\n" "${B[@]}"
+    printf "A %s\n" "${A[@]}"
+  ' _ "$PROJECT_DIR" 2>"$MGD_TEST_HOME/stderr"
 )" || true
-mgd_want="$(printf 'ro %s\nro %s' "$mgd_share/current" "$mgd_share/versions/pi/1.0")"
+mgd_want="$(printf 'B ro %s\nA --symlink\nA %s\nA %s' \
+  "$mgd_data/versions/pi/1.0" "$mgd_data/versions/pi/1.0" "$mgd_data/current/pi")"
 if [[ "$mgd_out" == "$mgd_want" ]]; then
-  ok "managed tool binds cover the active release only"
+  ok "managed tool binds: active release only, pinned current symlink"
 else
   fail "aicoding-managed tool binds" "got: $(tr '\n' '|' <<< "$mgd_out")"
+fi
+if grep -q "current/claude points outside" "$MGD_TEST_HOME/stderr"; then
+  ok "managed tool binds: out-of-tree pointer refused with a warning"
+else
+  fail "aicoding-managed tool binds" "out-of-tree pointer was not refused"
 fi
 rm -rf "$MGD_TEST_HOME"
 

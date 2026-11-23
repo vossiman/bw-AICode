@@ -56,7 +56,8 @@ BINDS=(
   "rw! $HOME/.local/state/opencode"
   "rw! $HOME/.cache/opencode"
 )
-add_managed_tool_binds BINDS opencode
+BW_MANAGED_ARGS=()
+add_managed_tool_binds BINDS BW_MANAGED_ARGS opencode
 
 # Overlay binds — placed after --tmpfs /tmp and --tmpfs /run
 OVERLAY_BINDS=(
@@ -71,6 +72,7 @@ build_bwrap_args OVERLAY_BINDS BWRAP_OVERLAY_ARGS
 BWRAP_CMD=(
   bwrap
   "${BWRAP_ARGS[@]}"
+  "${BW_MANAGED_ARGS[@]}"
   --proc /proc
   --dev /dev
   --tmpfs /dev/shm
