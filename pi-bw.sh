@@ -9,13 +9,22 @@ set -euo pipefail
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "$SCRIPT_DIR/bw-common.sh"
 
-# Locate pi on the host (lives under ~/.nvm, which isn't in the default sandbox
-# PATH). Checked before parse_bw_flags so we fail before the docker guard starts.
+# Locate pi on the host (under ~/.nvm, or an aicoding launcher in ~/.local/bin;
+# both may be off the default sandbox PATH). Checked before parse_bw_flags so we
+# fail before the docker guard starts.
 if ! PI_BIN="$(command -v pi)"; then
   echo "Error: pi not found in PATH — install with: npm install -g @earendil-works/pi-coding-agent" >&2
   exit 1
 fi
 PI_BIN_DIR="$(dirname "$PI_BIN")"
+
+# pi is a node script, and an aicoding launcher in ~/.local/bin does not put
+# node on PATH. Mount the host's node and put it ahead of the system paths so
+# the sandbox does not fall back to an older /usr/bin/node.
+NODE_BIN_DIR=""
+if NODE_BIN="$(command -v node)"; then
+  NODE_BIN_DIR="$(dirname "$(readlink -f "$NODE_BIN")")"
+fi
 
 parse_bw_flags "$@"
 
@@ -37,6 +46,9 @@ BINDS=(
   # pi config/state — rw! creates if missing
   "rw! $HOME/.pi"
 )
+[[ -n "$NODE_BIN_DIR" ]] && BINDS+=("ro $(dirname "$NODE_BIN_DIR")")
+BW_MANAGED_ARGS=()
+add_managed_tool_binds BINDS BW_MANAGED_ARGS pi
 
 # Symlinks under ~/.pi/agent/ (up to 3 levels deep: agent/<dir>/<subdir>/<file>)
 # can point outside bound paths — e.g. models.json, agents/*.md,
@@ -84,6 +96,7 @@ done
 BWRAP_CMD=(
   bwrap
   "${BWRAP_ARGS[@]}"
+  "${BW_MANAGED_ARGS[@]}"
   --proc /proc
   --dev /dev
   --tmpfs /dev/shm
@@ -92,7 +105,7 @@ BWRAP_CMD=(
   "${BWRAP_OVERLAY_ARGS[@]}"
   --symlink /run /var/run
   --setenv HOME "$HOME"
-  --setenv PATH "${BW_VENV_PATH:+$BW_VENV_PATH/bin:}$PI_BIN_DIR:$HOME/.local/bin:$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin"
+  --setenv PATH "${BW_VENV_PATH:+$BW_VENV_PATH/bin:}$PI_BIN_DIR:${NODE_BIN_DIR:+$NODE_BIN_DIR:}$HOME/.local/bin:$HOME/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin"
   --setenv SHELL /bin/bash
   ${SSH_AUTH_SOCK:+--ro-bind "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK"}
   ${SSH_AUTH_SOCK:+--setenv SSH_AUTH_SOCK "$SSH_AUTH_SOCK"}
@@ -104,7 +117,7 @@ BWRAP_CMD=(
   --unshare-ipc
   --unshare-pid
   --die-with-parent
-  pi "${BW_TOOL_ARGS[@]}"
+  "$PI_BIN" "${BW_TOOL_ARGS[@]}"
 )
 
 if [[ -n "${BW_GUARD_PID:-}" || -n "${BW_DENY_PATTERNS_FILE:-}" ]]; then

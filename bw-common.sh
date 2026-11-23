@@ -106,6 +106,33 @@ build_bwrap_args() {
   done
 }
 
+# --- aicoding-managed tool releases ---
+# aicoding installs each tool as a launcher (e.g. ~/.local/bin/<tool>) whose
+# `current=` line names <data>/current/<tool>, a symlink to
+# <data>/versions/<tool>/<ver>. Bind only that one release read-only, and give
+# the sandbox its own `current` symlink pinned to it: binding the live pointer
+# would break the launcher inside the sandbox once aicoding activates a newer
+# release mid-session. A target outside <data>/versions/<tool> is refused.
+# No-op when the tool is not aicoding-managed.
+# Usage: add_managed_tool_binds BINDS EXTRA_ARGS tool
+add_managed_tool_binds() {
+  local -n _mbinds=$1 _margs=$2
+  local tool=$3 launcher current root release
+  launcher="$(command -v "$tool")" || return 0
+  [[ -f "$launcher" ]] || return 0
+  grep -qx '# Managed by aicoding immutable runtime\.' "$launcher" || return 0
+  current="$(sed -n 's/^current=//p' "$launcher" | head -n 1)"
+  [[ "$current" == /* && -L "$current" ]] || return 0
+  root="$(readlink -f "$(dirname "$(dirname "$current")")/versions/$tool")" || return 0
+  release="$(readlink -f "$current")" || return 0
+  if [[ -z "$root" || ! -d "$release" || "$(dirname "$release")" != "$root" ]]; then
+    echo "[bw] Warning: $current points outside $root; not binding it" >&2
+    return 0
+  fi
+  _mbinds+=("ro $release")
+  _margs+=(--symlink "$release" "$current")
+}
+
 # --- Symlink target resolution ---
 # Recursively scans scan_root (bounded depth, default 3) for symlinks and
 # appends their resolved targets to the named output array, so callers can
@@ -372,7 +399,7 @@ derive_docker_allowlist() {
     local buildkit_digests
     buildkit_digests="$(docker image inspect \
       --format '{{range .RepoDigests}}{{println .}}{{end}}' \
-      moby/buildkit 2>/dev/null | sed -n 's/.*@//p' | sort -u)"
+      moby/buildkit 2>/dev/null | sed -n 's/.*@//p' | sort -u || true)"
     if [[ -n "$buildkit_digests" ]]; then
       infra_digests_json="$(printf '%s\n' "$buildkit_digests" | jq -R . | jq -s 'map(select(. != ""))')"
     fi
@@ -384,7 +411,7 @@ derive_docker_allowlist() {
     # as InfraImageDigests above. Seed both the container's full ID and its
     # name so a request addressed either way resolves.
     local buildkit_image_ids preowned=""
-    buildkit_image_ids="$(docker images -q moby/buildkit 2>/dev/null | sort -u)"
+    buildkit_image_ids="$(docker images -q moby/buildkit 2>/dev/null | sort -u || true)"
     if [[ -n "$buildkit_image_ids" ]]; then
       while IFS= read -r img_id; do
         [[ -z "$img_id" ]] && continue
